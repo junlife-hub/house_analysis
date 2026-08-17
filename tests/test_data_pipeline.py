@@ -5,6 +5,7 @@ import pandas as pd
 
 from data_pipeline import (
     SERVICE_NAME,
+    build_effective_transactions,
     build_data_status,
     combine_raw_data,
     count_repeated_source_rows,
@@ -114,6 +115,123 @@ class DataPipelineTests(unittest.TestCase):
 
         self.assertEqual(removed, 0)
         self.assertEqual(len(combined), 2)
+
+    def test_effective_transactions_excludes_cancel_and_prior_original(self):
+        original = {
+            "RCPT_YR": 2025,
+            "CGG_CD": 11110,
+            "STDG_CD": 10100,
+            "LOTNO_SE": 1,
+            "MNO": 10,
+            "SNO": 2,
+            "BLDG_NM": "테스트아파트",
+            "CTRT_DAY": pd.Timestamp("2025-12-20"),
+            "THING_AMT": 10.0,
+            "ARCH_AREA": 84.9,
+            "FLR": 10,
+            "BLDG_USG": "아파트",
+            "DCLR_SE": "중개거래",
+            "OPBIZ_RESTAGNT_SGG_NM": "서울 종로구",
+            "RTRCN_DAY": pd.NA,
+        }
+        cancellation = {
+            **original,
+            "RCPT_YR": 2026,
+            "RTRCN_DAY": 20260110,
+            "OPBIZ_RESTAGNT_SGG_NM": "서울 종로구 서울 중구",
+        }
+        active = {
+            **original,
+            "CTRT_DAY": pd.Timestamp("2026-01-15"),
+            "RCPT_YR": 2026,
+            "RTRCN_DAY": pd.NA,
+        }
+
+        effective, quality = build_effective_transactions(
+            pd.DataFrame([original, cancellation, active])
+        )
+
+        self.assertEqual(len(effective), 1)
+        self.assertEqual(effective.iloc[0]["CTRT_DAY"], active["CTRT_DAY"])
+        self.assertEqual(quality["original_count"], 3)
+        self.assertEqual(quality["cancellation_row_count"], 1)
+        self.assertEqual(quality["matched_original_count"], 1)
+        self.assertEqual(quality["unmatched_cancellation_count"], 0)
+        self.assertEqual(quality["ambiguous_cancellation_count"], 0)
+        self.assertEqual(quality["effective_count"], 1)
+
+    def test_effective_transactions_reports_unmatched_cancellation(self):
+        cancellation = pd.DataFrame(
+            [
+                {
+                    "RCPT_YR": 2026,
+                    "BLDG_NM": "테스트아파트",
+                    "CTRT_DAY": pd.Timestamp("2025-12-20"),
+                    "THING_AMT": 10.0,
+                    "ARCH_AREA": 84.9,
+                    "FLR": 10,
+                    "RTRCN_DAY": 20260110,
+                }
+            ]
+        )
+
+        effective, quality = build_effective_transactions(cancellation)
+
+        self.assertTrue(effective.empty)
+        self.assertEqual(quality["unmatched_cancellation_count"], 1)
+        self.assertEqual(quality["matched_original_count"], 0)
+
+    def test_effective_transactions_does_not_guess_between_extra_candidates(self):
+        original = {
+            "RCPT_YR": 2025,
+            "BLDG_NM": "동일조건아파트",
+            "CTRT_DAY": pd.Timestamp("2025-12-20"),
+            "THING_AMT": 10.0,
+            "ARCH_AREA": 84.9,
+            "FLR": 10,
+            "RTRCN_DAY": pd.NA,
+        }
+        cancellation = {
+            **original,
+            "RCPT_YR": 2026,
+            "RTRCN_DAY": 20260110,
+        }
+
+        effective, quality = build_effective_transactions(
+            pd.DataFrame([original, original.copy(), cancellation])
+        )
+
+        self.assertEqual(len(effective), 2)
+        self.assertEqual(quality["ambiguous_cancellation_count"], 1)
+        self.assertEqual(quality["matched_original_count"], 0)
+
+    def test_effective_transactions_reconciles_equal_occurrence_counts(self):
+        original = {
+            "RCPT_YR": 2025,
+            "BLDG_NM": "동일조건아파트",
+            "CTRT_DAY": pd.Timestamp("2025-12-20"),
+            "THING_AMT": 10.0,
+            "ARCH_AREA": 84.9,
+            "FLR": 10,
+            "RTRCN_DAY": pd.NA,
+        }
+        cancellation = {
+            **original,
+            "RCPT_YR": 2026,
+            "RTRCN_DAY": 20260110,
+        }
+
+        effective, quality = build_effective_transactions(
+            pd.DataFrame(
+                [original, original.copy(), cancellation, cancellation.copy()]
+            )
+        )
+
+        self.assertTrue(effective.empty)
+        self.assertEqual(quality["cancellation_row_count"], 2)
+        self.assertEqual(quality["matched_original_count"], 2)
+        self.assertEqual(quality["unmatched_cancellation_count"], 0)
+        self.assertEqual(quality["ambiguous_cancellation_count"], 0)
 
     def test_current_month_is_not_reported_as_missing(self):
         data = pd.DataFrame(

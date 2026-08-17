@@ -18,6 +18,7 @@ from analysis import (
     load_watchlist,
 )
 from data_pipeline import (
+    build_effective_transactions,
     build_data_status,
     combine_raw_data,
     current_year,
@@ -95,7 +96,11 @@ def load_cached_stored_data(
     # signatures is intentionally part of the cache key so a file update
     # invalidates the cached DataFrame without relying on a fixed TTL.
     raw = load_stored_raw_data(BASE_DIR)
-    return preprocess_data(raw, minimum_year=_minimum_file_year(signatures))
+    prepared, quality = preprocess_data(
+        raw, minimum_year=_minimum_file_year(signatures)
+    )
+    effective, cancellation_quality = build_effective_transactions(prepared)
+    return effective, {**quality, **cancellation_quality}
 
 
 @st.cache_data(ttl=3_600, show_spinner=False)
@@ -228,10 +233,12 @@ if data_mode.endswith("년 API"):
                 api_raw = fetch_cached_api_data(API_KEY, CURRENT_YEAR)
                 stored_raw = load_stored_raw_data(BASE_DIR)
                 combined_raw, snapshot_overlaps = combine_raw_data([stored_raw, api_raw])
-                df, quality = preprocess_data(
+                prepared, quality = preprocess_data(
                     combined_raw,
                     minimum_year=_minimum_file_year(file_signatures) or CURRENT_YEAR,
                 )
+                df, cancellation_quality = build_effective_transactions(prepared)
+                quality = {**quality, **cancellation_quality}
                 st.sidebar.success(
                     f"{CURRENT_YEAR}년 API {len(api_raw):,}건 병합 · "
                     f"스냅샷 겹침 {snapshot_overlaps:,}건 제외"
@@ -260,6 +267,13 @@ if quality["potential_repeated_rows"]:
         f"동일 공개 속성 반복 {quality['potential_repeated_rows']:,}건은 "
         "별도 호실 거래일 수 있어 보존했습니다."
     )
+
+st.caption(
+    f"취소행 {quality['cancellation_row_count']:,}건과 대응 원거래 "
+    f"{quality['matched_original_count']:,}건을 분석에서 제외했습니다. "
+    f"미매칭 {quality['unmatched_cancellation_count']:,}건 · "
+    f"모호 {quality['ambiguous_cancellation_count']:,}건"
+)
 
 if status["missing_past_months"]:
     missing_labels = ", ".join(

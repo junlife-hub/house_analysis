@@ -46,6 +46,18 @@ SOURCE_RECORD_COLUMNS = [
     "OPBIZ_RESTAGNT_SGG_NM",
 ]
 
+# A cancellation record can be published in a later receipt-year snapshot than
+# the original transaction.  Receipt year and cancellation date therefore
+# cannot identify the underlying transaction, and broker-office coverage can
+# change when the cancellation is reported.  All other published attributes
+# are kept in the match key to make cross-year cancellation matching as
+# conservative as possible.
+CANCELLATION_MATCH_COLUMNS = [
+    column
+    for column in SOURCE_RECORD_COLUMNS
+    if column not in {"RCPT_YR", "RTRCN_DAY", "OPBIZ_RESTAGNT_SGG_NM"}
+]
+
 NUMERIC_COLUMNS = [
     "RCPT_YR",
     "CGG_CD",
@@ -243,6 +255,139 @@ def preprocess_data(
         "potential_repeated_rows": repeated_count,
         "match_columns": key_columns,
     }
+
+
+def build_effective_transactions(
+    df: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict[str, int | list[str]]]:
+    """Build an analysis-only view with cancelled transactions removed.
+
+    Raw receipt-year snapshots remain unchanged.  Every row with RTRCN_DAY is
+    excluded from analysis.  A non-cancelled row from an earlier receipt year
+    is also excluded only when the complete stable public-attribute key yields
+    a conservative occurrence-level match.
+
+    If there are more indistinguishable prior candidates than cancellation
+    occurrences, no candidate is removed because choosing one would be
+    arbitrary.  The cancellation rows themselves are still excluded and the
+    ambiguous occurrences are reported in the quality metrics.
+    """
+    original_count = int(len(df))
+    match_columns = [
+        column for column in CANCELLATION_MATCH_COLUMNS if column in df.columns
+    ]
+    empty_quality: dict[str, int | list[str]] = {
+        "original_count": original_count,
+        "cancellation_row_count": 0,
+        "matched_original_count": 0,
+        "unmatched_cancellation_count": 0,
+        "ambiguous_cancellation_count": 0,
+        "effective_count": original_count,
+        "cancellation_match_columns": match_columns,
+    }
+    if df.empty or "RTRCN_DAY" not in df.columns:
+        return df.copy().reset_index(drop=True), empty_quality
+
+    cancellation_values = _clean_numeric(df["RTRCN_DAY"])
+    cancellation_mask = cancellation_values.notna() & cancellation_values.ne(0)
+    cancellation_count = int(cancellation_mask.sum())
+    if cancellation_count == 0:
+        return df.copy().reset_index(drop=True), empty_quality
+
+    if "RCPT_YR" not in df.columns:
+        effective = df.loc[~cancellation_mask].copy().reset_index(drop=True)
+        return effective, {
+            **empty_quality,
+            "cancellation_row_count": cancellation_count,
+            "unmatched_cancellation_count": cancellation_count,
+            "effective_count": int(len(effective)),
+        }
+
+    canonical_key = _canonical_match_key(df, match_columns)
+    match_group = canonical_key.groupby(
+        match_columns,
+        dropna=False,
+        sort=False,
+    ).ngroup()
+    receipt_year = _clean_numeric(df["RCPT_YR"]).astype("Int64")
+
+    working = pd.DataFrame(
+        {
+            "row_index": df.index.to_numpy(),
+            "match_group": match_group.to_numpy(),
+            "receipt_year": receipt_year.to_numpy(),
+            "is_cancelled": cancellation_mask.to_numpy(),
+        }
+    )
+    matched_original_indices: set[object] = set()
+    matched_count = 0
+    unmatched_count = 0
+    ambiguous_count = 0
+
+    cancelled_rows = working.loc[working["is_cancelled"]]
+    cancellation_match_groups = cancelled_rows["match_group"].unique()
+    candidate_normal_rows = working.loc[
+        ~working["is_cancelled"]
+        & working["match_group"].isin(cancellation_match_groups)
+    ]
+    normal_rows_by_group = {
+        int(group): group_rows.sort_values(
+            ["receipt_year", "row_index"], kind="stable"
+        )
+        for group, group_rows in candidate_normal_rows.groupby(
+            "match_group", sort=False
+        )
+    }
+
+    missing_year_count = int(cancelled_rows["receipt_year"].isna().sum())
+    unmatched_count += missing_year_count
+    dated_cancellations = cancelled_rows.dropna(subset=["receipt_year"])
+
+    cancellation_groups = (
+        dated_cancellations.groupby(
+            ["match_group", "receipt_year"],
+            dropna=False,
+            sort=True,
+        )
+        .size()
+        .rename("cancellation_count")
+        .reset_index()
+    )
+    for cancellation_group in cancellation_groups.itertuples(index=False):
+        group_id = int(cancellation_group.match_group)
+        cancellation_year = int(cancellation_group.receipt_year)
+        group_cancellation_count = int(cancellation_group.cancellation_count)
+        normal_rows = normal_rows_by_group.get(group_id)
+        if normal_rows is None:
+            unmatched_count += group_cancellation_count
+            continue
+
+        candidates = normal_rows[
+            normal_rows["receipt_year"].lt(cancellation_year)
+            & ~normal_rows["row_index"].isin(matched_original_indices)
+        ]
+        candidate_count = int(len(candidates))
+        if candidate_count == 0:
+            unmatched_count += group_cancellation_count
+        elif candidate_count <= group_cancellation_count:
+            matched_original_indices.update(candidates["row_index"].tolist())
+            matched_count += candidate_count
+            unmatched_count += group_cancellation_count - candidate_count
+        else:
+            ambiguous_count += group_cancellation_count
+
+    effective_mask = ~cancellation_mask & ~df.index.isin(matched_original_indices)
+    effective = df.loc[effective_mask].copy().reset_index(drop=True)
+    quality: dict[str, int | list[str]] = {
+        "original_count": original_count,
+        "cancellation_row_count": cancellation_count,
+        "matched_original_count": matched_count,
+        "unmatched_cancellation_count": unmatched_count,
+        "ambiguous_cancellation_count": ambiguous_count,
+        "effective_count": int(len(effective)),
+        "cancellation_match_columns": match_columns,
+    }
+    return effective, quality
 
 
 def fetch_api_data(
