@@ -3,6 +3,7 @@ import unittest
 import pandas as pd
 
 from analysis import (
+    build_monthly_trend,
     build_watchlist_summary,
     filter_complex_transactions,
     select_reference_price,
@@ -19,12 +20,27 @@ def transactions(name, amounts_and_dates):
             "THING_AMT": [amount for _, amount in amounts_and_dates],
             "ARCH_AREA": [59.0] * len(amounts_and_dates),
             "PRICE_PER_SQM": [amount / 59.0 for _, amount in amounts_and_dates],
+            "CONTRACT_YEAR_MONTH": [date[:7] for date, _ in amounts_and_dates],
             "YEAR_MONTH": [date[:7] for date, _ in amounts_and_dates],
         }
     )
 
 
 class AnalysisTests(unittest.TestCase):
+    def test_monthly_trend_uses_contract_year_month_and_keeps_alias(self):
+        data = transactions(
+            "A",
+            [("2025-12-31", 8.0), ("2026-01-01", 10.0)],
+        )
+
+        trend = build_monthly_trend(data)
+
+        self.assertEqual(
+            trend["CONTRACT_YEAR_MONTH"].tolist(), ["2025-12", "2026-01"]
+        )
+        self.assertEqual(trend["YEAR_MONTH"].tolist(), ["2025-12", "2026-01"])
+        self.assertEqual(trend["거래건수"].tolist(), [1, 1])
+
     def test_reference_price_prefers_three_month_median(self):
         data = transactions(
             "A",

@@ -6,8 +6,8 @@ on:
     - cron: "15 20 * * *"
   workflow_dispatch:
     inputs:
-      year:
-        description: "Contract year to update (blank = current year)"
+      receipt_year:
+        description: "API receipt year (RCPT_YR) to update (blank = current year)"
         required: false
         type: string
 
@@ -35,13 +35,13 @@ jobs:
       - name: Install updater dependencies
         run: pip install -r requirements.txt
 
-      - name: Update current-year data
+      - name: Update current receipt-year data
         env:
           SEOUL_API_KEY: ${{ secrets.SEOUL_API_KEY }}
-          UPDATE_YEAR: ${{ inputs.year }}
+          RECEIPT_YEAR: ${{ inputs.receipt_year }}
         run: |
-          if [ -n "$UPDATE_YEAR" ]; then
-            python data_updater.py --year "$UPDATE_YEAR"
+          if [ -n "$RECEIPT_YEAR" ]; then
+            python data_updater.py --receipt-year "$RECEIPT_YEAR"
           else
             python data_updater.py
           fi

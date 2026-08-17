@@ -18,6 +18,7 @@ from analysis import (
     load_watchlist,
 )
 from data_pipeline import (
+    DEFAULT_ANALYSIS_START_DATE,
     build_effective_transactions,
     build_data_status,
     combine_raw_data,
@@ -32,7 +33,10 @@ from data_pipeline import (
 
 BASE_DIR = Path(__file__).resolve().parent
 WATCHLIST_PATH = BASE_DIR / "watchlist.csv"
-CURRENT_YEAR = current_year()
+CURRENT_CALENDAR_YEAR = current_year()
+CURRENT_RECEIPT_YEAR = CURRENT_CALENDAR_YEAR
+CURRENT_CONTRACT_YEAR = CURRENT_CALENDAR_YEAR
+ANALYSIS_START_DATE = DEFAULT_ANALYSIS_START_DATE
 
 st.set_page_config(page_title="서울 부동산 실거래가 실시간 분석", layout="wide")
 
@@ -80,15 +84,6 @@ st.markdown(
 )
 
 
-def _minimum_file_year(signatures: tuple[tuple[str, int, int], ...]) -> int | None:
-    years = []
-    for path, _, _ in signatures:
-        match = re.search(r"seoul_real_estate_(\d{4})_", path)
-        if match:
-            years.append(int(match.group(1)))
-    return min(years) if years else None
-
-
 @st.cache_data(show_spinner=False)
 def load_cached_stored_data(
     signatures: tuple[tuple[str, int, int], ...],
@@ -97,15 +92,15 @@ def load_cached_stored_data(
     # invalidates the cached DataFrame without relying on a fixed TTL.
     raw = load_stored_raw_data(BASE_DIR)
     prepared, quality = preprocess_data(
-        raw, minimum_year=_minimum_file_year(signatures)
+        raw, analysis_start_date=ANALYSIS_START_DATE
     )
     effective, cancellation_quality = build_effective_transactions(prepared)
     return effective, {**quality, **cancellation_quality}
 
 
 @st.cache_data(ttl=3_600, show_spinner=False)
-def fetch_cached_api_data(api_key: str, year: int) -> pd.DataFrame:
-    return fetch_api_data(api_key, year)
+def fetch_cached_api_data(api_key: str, receipt_year: int) -> pd.DataFrame:
+    return fetch_api_data(api_key, receipt_year)
 
 
 @st.cache_data(show_spinner=False)
@@ -171,7 +166,7 @@ def render_monthly_chart(
         key=f"{key_prefix}_trend_metric",
     )
     labels = {
-        "YEAR_MONTH": "계약년월",
+        "CONTRACT_YEAR_MONTH": "계약년월",
         "평균가": "평균 거래금액(억)",
         "중앙값": "중앙 거래금액(억)",
         "거래건수": "거래건수",
@@ -179,7 +174,7 @@ def render_monthly_chart(
     }
     figure = px.line(
         trend,
-        x="YEAR_MONTH",
+        x="CONTRACT_YEAR_MONTH",
         y=metric,
         markers=True,
         labels=labels,
@@ -193,7 +188,7 @@ def render_monthly_chart(
         if valid.sum() > 1:
             coefficients = np.polyfit(x_values[valid], y_values[valid], 1)
             figure.add_scatter(
-                x=trend["YEAR_MONTH"],
+                x=trend["CONTRACT_YEAR_MONTH"],
                 y=np.poly1d(coefficients)(x_values),
                 mode="lines",
                 name="추세선",
@@ -211,10 +206,11 @@ def render_monthly_chart(
 
 
 st.sidebar.title("🛠️ 데이터 옵션")
+api_mode_label = f"저장 파일 + {CURRENT_RECEIPT_YEAR}년 접수연도 API"
 data_mode = st.sidebar.radio(
     "데이터 모드",
-    ["저장 파일 우선 (권장)", f"저장 파일 + {CURRENT_YEAR}년 API"],
-    help="API 모드는 명시적으로 선택했을 때만 현재연도 전체 데이터를 가져옵니다.",
+    ["저장 파일 우선 (권장)", api_mode_label],
+    help="API 모드는 명시적으로 선택했을 때만 현재 접수연도 전체 데이터를 가져옵니다.",
 )
 if st.sidebar.button("🔄 파일·캐시 새로고침"):
     st.cache_data.clear()
@@ -224,23 +220,25 @@ file_signatures = data_file_signatures(BASE_DIR)
 with st.spinner("저장된 실거래 데이터를 불러오는 중입니다..."):
     df, quality = load_cached_stored_data(file_signatures)
 
-if data_mode.endswith("년 API"):
+if data_mode == api_mode_label:
     if not API_KEY:
         st.sidebar.error("SEOUL_API_KEY가 없어 저장 파일만 표시합니다.")
     else:
-        with st.spinner(f"{CURRENT_YEAR}년 API 전체 데이터를 가져오는 중입니다..."):
+        with st.spinner(
+            f"{CURRENT_RECEIPT_YEAR}년 접수연도 API 전체 데이터를 가져오는 중입니다..."
+        ):
             try:
-                api_raw = fetch_cached_api_data(API_KEY, CURRENT_YEAR)
+                api_raw = fetch_cached_api_data(API_KEY, CURRENT_RECEIPT_YEAR)
                 stored_raw = load_stored_raw_data(BASE_DIR)
                 combined_raw, snapshot_overlaps = combine_raw_data([stored_raw, api_raw])
                 prepared, quality = preprocess_data(
                     combined_raw,
-                    minimum_year=_minimum_file_year(file_signatures) or CURRENT_YEAR,
+                    analysis_start_date=ANALYSIS_START_DATE,
                 )
                 df, cancellation_quality = build_effective_transactions(prepared)
                 quality = {**quality, **cancellation_quality}
                 st.sidebar.success(
-                    f"{CURRENT_YEAR}년 API {len(api_raw):,}건 병합 · "
+                    f"{CURRENT_RECEIPT_YEAR}년 접수 API {len(api_raw):,}건 병합 · "
                     f"스냅샷 겹침 {snapshot_overlaps:,}건 제외"
                 )
             except Exception as exc:
@@ -253,13 +251,16 @@ if df.empty:
 
 watchlist = load_cached_watchlist(str(WATCHLIST_PATH), WATCHLIST_PATH.stat().st_mtime_ns)
 metadata = read_update_metadata(BASE_DIR)
-status = build_data_status(df, CURRENT_YEAR)
+status = build_data_status(df, CURRENT_CONTRACT_YEAR)
 
 status_columns = st.columns(5)
 status_columns[0].metric("데이터 최초일", format_date(status["first_date"]))
 status_columns[1].metric("데이터 기준일", format_date(status["last_date"]))
 status_columns[2].metric("전체 거래건수", f"{status['total_count']:,}건")
-status_columns[3].metric(f"{CURRENT_YEAR}년 거래건수", f"{status['current_year_count']:,}건")
+status_columns[3].metric(
+    f"{CURRENT_CONTRACT_YEAR}년 계약건수",
+    f"{status['contract_year_count']:,}건",
+)
 status_columns[4].metric("마지막 자동 업데이트", format_update_time(metadata))
 
 if quality["potential_repeated_rows"]:
@@ -277,17 +278,23 @@ st.caption(
 
 if status["missing_past_months"]:
     missing_labels = ", ".join(
-        f"{CURRENT_YEAR}년 {month}월" for month in status["missing_past_months"]
+        f"{CURRENT_CONTRACT_YEAR}년 {month}월"
+        for month in status["missing_past_months"]
     )
     st.warning(
         f"⚠️ 이미 지난 월 중 데이터가 없는 기간: {missing_labels}. "
         "GitHub Actions 실행 상태와 데이터 파일을 확인하세요."
     )
 
-with st.sidebar.expander(f"📋 {CURRENT_YEAR}년 월별 데이터 상태", expanded=True):
+with st.sidebar.expander(
+    f"📋 {CURRENT_CONTRACT_YEAR}년 계약월별 데이터 상태", expanded=True
+):
     month_status = pd.DataFrame(
         {
-            "계약월": [f"{CURRENT_YEAR}-{month:02d}" for month in status["month_counts"]],
+            "계약월": [
+                f"{CURRENT_CONTRACT_YEAR}-{month:02d}"
+                for month in status["month_counts"]
+            ],
             "거래건수": list(status["month_counts"].values()),
         }
     )
@@ -339,16 +346,21 @@ with tabs[0]:
         with right:
             st.subheader("📈 주력 평형 평균 가격 추이")
             mega_trend = (
-                mega_filtered.groupby(["YEAR_MONTH", "GROUP_NM"], as_index=False)[
+                mega_filtered.groupby(
+                    ["CONTRACT_YEAR_MONTH", "GROUP_NM"], as_index=False
+                )[
                     "THING_AMT"
                 ].mean()
             )
             figure = px.line(
                 mega_trend,
-                x="YEAR_MONTH",
+                x="CONTRACT_YEAR_MONTH",
                 y="THING_AMT",
                 color="GROUP_NM",
-                labels={"THING_AMT": "평균 거래금액(억)", "YEAR_MONTH": "계약년월"},
+                labels={
+                    "THING_AMT": "평균 거래금액(억)",
+                    "CONTRACT_YEAR_MONTH": "계약년월",
+                },
                 title="단지별 대표 평형 가격 변동",
                 markers=True,
             )
@@ -540,7 +552,7 @@ st.sidebar.info(
     """
 **데이터 갱신 안내**
 - 기본 모드는 저장된 CSV만 읽습니다.
-- GitHub Actions가 하루 1회 현재연도 파일을 갱신합니다.
+- GitHub Actions가 하루 1회 현재 접수연도 파일을 갱신합니다.
 - API 모드는 필요할 때만 명시적으로 선택하세요.
 """
 )

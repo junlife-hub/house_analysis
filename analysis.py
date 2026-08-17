@@ -203,16 +203,30 @@ def _gap_direction(value: object) -> str:
 def build_monthly_trend(transactions: pd.DataFrame) -> pd.DataFrame:
     if transactions.empty:
         return pd.DataFrame(
-            columns=["YEAR_MONTH", "평균가", "중앙값", "거래건수", "㎡당 가격"]
+            columns=[
+                "CONTRACT_YEAR_MONTH",
+                "YEAR_MONTH",
+                "평균가",
+                "중앙값",
+                "거래건수",
+                "㎡당 가격",
+            ]
         )
+    month_column = (
+        "CONTRACT_YEAR_MONTH"
+        if "CONTRACT_YEAR_MONTH" in transactions.columns
+        else "YEAR_MONTH"
+    )
     monthly = (
-        transactions.groupby("YEAR_MONTH", as_index=False)
+        transactions.groupby(month_column, as_index=False)
         .agg(
             평균가=("THING_AMT", "mean"),
             중앙값=("THING_AMT", "median"),
             거래건수=("THING_AMT", "size"),
             **{"㎡당 가격": ("PRICE_PER_SQM", "mean")},
         )
-        .sort_values("YEAR_MONTH")
+        .rename(columns={month_column: "CONTRACT_YEAR_MONTH"})
+        .sort_values("CONTRACT_YEAR_MONTH")
     )
+    monthly["YEAR_MONTH"] = monthly["CONTRACT_YEAR_MONTH"]
     return monthly

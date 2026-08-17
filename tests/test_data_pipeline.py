@@ -4,6 +4,7 @@ import unittest
 import pandas as pd
 
 from data_pipeline import (
+    DEFAULT_ANALYSIS_START_DATE,
     SERVICE_NAME,
     build_effective_transactions,
     build_data_status,
@@ -11,6 +12,7 @@ from data_pipeline import (
     count_repeated_source_rows,
     current_year,
     fetch_api_data,
+    preprocess_data,
 )
 
 
@@ -38,6 +40,54 @@ class FakeSession:
 class DataPipelineTests(unittest.TestCase):
     def test_current_year_uses_supplied_date(self):
         self.assertEqual(current_year(dt.date(2031, 1, 1)), 2031)
+
+    def test_preprocess_separates_receipt_contract_and_cancel_dates(self):
+        raw = pd.DataFrame(
+            {
+                "RCPT_YR": [2026],
+                "CTRT_DAY": [20251231],
+                "RTRCN_DAY": [20260115],
+                "THING_AMT": [100000],
+                "ARCH_AREA": [84.9],
+                "BLDG_NM": ["테스트아파트"],
+                "FLR": [10],
+            }
+        )
+
+        prepared, _ = preprocess_data(raw)
+        row = prepared.iloc[0]
+
+        self.assertEqual(DEFAULT_ANALYSIS_START_DATE, dt.date(2025, 1, 1))
+        self.assertEqual(row["RCPT_YR"], 2026)
+        self.assertEqual(row["CTRT_DAY"], pd.Timestamp("2025-12-31"))
+        self.assertEqual(row["CONTRACT_YEAR"], 2025)
+        self.assertEqual(row["CONTRACT_MONTH"], 12)
+        self.assertEqual(row["CONTRACT_YEAR_MONTH"], "2025-12")
+        self.assertEqual(row["YEAR_MONTH"], "2025-12")
+        self.assertEqual(row["CANCEL_DATE"], pd.Timestamp("2026-01-15"))
+
+    def test_analysis_start_date_is_explicit_and_independent_of_receipt_year(self):
+        raw = pd.DataFrame(
+            {
+                "RCPT_YR": [2026, 2026],
+                "CTRT_DAY": [20241231, 20250101],
+                "RTRCN_DAY": [pd.NA, pd.NA],
+                "THING_AMT": [90000, 100000],
+                "ARCH_AREA": [84.9, 84.9],
+                "BLDG_NM": ["테스트아파트", "테스트아파트"],
+                "FLR": [9, 10],
+            }
+        )
+
+        default_view, _ = preprocess_data(raw)
+        expanded_view, _ = preprocess_data(
+            raw, analysis_start_date="2024-01-01"
+        )
+
+        self.assertEqual(len(default_view), 1)
+        self.assertEqual(default_view.iloc[0]["CTRT_DAY"], pd.Timestamp("2025-01-01"))
+        self.assertEqual(len(expanded_view), 2)
+        self.assertTrue(expanded_view["RCPT_YR"].eq(2026).all())
 
     def test_single_snapshot_preserves_repeated_rows_and_cancellation(self):
         base = {
@@ -246,33 +296,34 @@ class DataPipelineTests(unittest.TestCase):
 
         self.assertEqual(status["month_counts"], {1: 1, 2: 0, 3: 1, 4: 0})
         self.assertEqual(status["missing_past_months"], [2])
+        self.assertEqual(status["contract_year_count"], 2)
 
-    def test_api_fetch_reads_all_pages_for_requested_year(self):
-        year = current_year()
+    def test_api_fetch_reads_all_pages_for_requested_receipt_year(self):
+        receipt_year = current_year()
         session = FakeSession(
             [
                 {
                     SERVICE_NAME: {
                         "list_total_count": 1_500,
                         "RESULT": {"CODE": "INFO-000", "MESSAGE": "정상 처리되었습니다"},
-                        "row": [{"CTRT_DAY": f"{year}0101"}] * 1_000,
+                        "row": [{"CTRT_DAY": f"{receipt_year}0101"}] * 1_000,
                     }
                 },
                 {
                     SERVICE_NAME: {
                         "list_total_count": 1_500,
                         "RESULT": {"CODE": "INFO-000", "MESSAGE": "정상 처리되었습니다"},
-                        "row": [{"CTRT_DAY": f"{year}0102"}] * 500,
+                        "row": [{"CTRT_DAY": f"{receipt_year}0102"}] * 500,
                     }
                 },
             ]
         )
 
-        fetched = fetch_api_data("test-key", year, session=session)
+        fetched = fetch_api_data("test-key", receipt_year, session=session)
 
         self.assertEqual(len(fetched), 1_500)
-        self.assertIn(f"/1/1000/{year}", session.urls[0][0])
-        self.assertIn(f"/1001/2000/{year}", session.urls[1][0])
+        self.assertIn(f"/1/1000/{receipt_year}", session.urls[0][0])
+        self.assertIn(f"/1001/2000/{receipt_year}", session.urls[1][0])
         self.assertEqual(len(session.urls), 2)
 
 

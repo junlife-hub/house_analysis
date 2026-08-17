@@ -15,8 +15,9 @@ if TYPE_CHECKING:
 
 SERVICE_NAME = "tbLnOpendataRtmsV"
 API_BASE_URL = "http://openapi.seoul.go.kr:8088"
-DATA_FILENAME = "seoul_real_estate_{year}_부동산실거래가.csv"
+DATA_FILENAME = "seoul_real_estate_{receipt_year}_부동산실거래가.csv"
 UPDATE_METADATA_FILENAME = "last_update.json"
+DEFAULT_ANALYSIS_START_DATE = dt.date(2025, 1, 1)
 
 # The Seoul API does not expose a transaction ID or a unit/호 number. These are
 # the complete fields currently available in the CSV. They can match snapshots,
@@ -82,21 +83,21 @@ def current_year(today: dt.date | None = None) -> int:
     return (today or dt.date.today()).year
 
 
-def _year_from_filename(path: Path) -> int | None:
+def _receipt_year_from_filename(path: Path) -> int | None:
     match = re.search(r"seoul_real_estate_(\d{4})_", path.name)
     return int(match.group(1)) if match else None
 
 
 def discover_data_files(base_dir: str | Path) -> list[Path]:
-    """Return one stored CSV per year, preferring data/ over the repo root."""
+    """Return one stored CSV per receipt year, preferring data/ over root."""
     base_path = Path(base_dir)
     selected: dict[int, Path] = {}
     for directory in (base_path, base_path / "data"):
         for path in sorted(directory.glob("seoul_real_estate_*_부동산실거래가.csv")):
-            year = _year_from_filename(path)
-            if year is not None:
-                selected[year] = path
-    return [selected[year] for year in sorted(selected)]
+            receipt_year = _receipt_year_from_filename(path)
+            if receipt_year is not None:
+                selected[receipt_year] = path
+    return [selected[receipt_year] for receipt_year in sorted(selected)]
 
 
 def data_file_signatures(base_dir: str | Path) -> tuple[tuple[str, int, int], ...]:
@@ -212,7 +213,9 @@ def combine_raw_data(frames: Iterable[pd.DataFrame]) -> tuple[pd.DataFrame, int]
 
 def preprocess_data(
     df: pd.DataFrame,
-    minimum_year: int | None = 2025,
+    analysis_start_date: str | dt.date | dt.datetime | pd.Timestamp | None = (
+        DEFAULT_ANALYSIS_START_DATE
+    ),
 ) -> tuple[pd.DataFrame, dict[str, int | list[str]]]:
     """Validate and normalize raw API columns for dashboard analysis."""
     if df.empty:
@@ -240,13 +243,39 @@ def preprocess_data(
     )
     invalid_dates = int(cleaned["CTRT_DAY"].isna().sum())
     cleaned = cleaned.dropna(subset=["CTRT_DAY", "THING_AMT", "ARCH_AREA"])
-    if minimum_year is not None:
-        cleaned = cleaned[cleaned["CTRT_DAY"].dt.year >= minimum_year]
+    if analysis_start_date is not None:
+        try:
+            start_date = pd.Timestamp(analysis_start_date).normalize()
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"분석 시작일이 올바르지 않습니다: {analysis_start_date}"
+            ) from exc
+        if pd.isna(start_date):
+            raise ValueError(f"분석 시작일이 올바르지 않습니다: {analysis_start_date}")
+        cleaned = cleaned[cleaned["CTRT_DAY"] >= start_date]
+
+    cleaned["CONTRACT_YEAR"] = cleaned["CTRT_DAY"].dt.year.astype("Int64")
+    cleaned["CONTRACT_MONTH"] = cleaned["CTRT_DAY"].dt.month.astype("Int64")
+    cleaned["CONTRACT_YEAR_MONTH"] = (
+        cleaned["CTRT_DAY"].dt.to_period("M").astype(str)
+    )
+    if "RTRCN_DAY" in cleaned.columns:
+        cleaned["CANCEL_DATE"] = pd.to_datetime(
+            cleaned["RTRCN_DAY"].astype("Int64").astype("string"),
+            format="%Y%m%d",
+            errors="coerce",
+        )
+    else:
+        cleaned["CANCEL_DATE"] = pd.Series(
+            pd.NaT, index=cleaned.index, dtype="datetime64[ns]"
+        )
 
     # Source amounts are expressed in 10,000 KRW; dashboard amounts use 억 KRW.
     cleaned["THING_AMT"] = cleaned["THING_AMT"] / 10_000.0
     cleaned["PRICE_PER_SQM"] = cleaned["THING_AMT"] / cleaned["ARCH_AREA"].replace(0, pd.NA)
-    cleaned["YEAR_MONTH"] = cleaned["CTRT_DAY"].dt.to_period("M").astype(str)
+    # Compatibility alias for existing callers. New analysis code should use
+    # CONTRACT_YEAR_MONTH so it cannot be confused with receipt year.
+    cleaned["YEAR_MONTH"] = cleaned["CONTRACT_YEAR_MONTH"]
 
     repeated_count, key_columns = count_repeated_source_rows(cleaned)
     return cleaned.reset_index(drop=True), {
@@ -392,20 +421,20 @@ def build_effective_transactions(
 
 def fetch_api_data(
     api_key: str,
-    year: int,
+    receipt_year: int,
     *,
     page_size: int = 1_000,
     timeout: int = 30,
     session: requests.Session | None = None,
     progress_callback: Callable[[int, int | None], None] | None = None,
 ) -> pd.DataFrame:
-    """Fetch every available page for a given contract year."""
+    """Fetch every available page for a given API receipt year (RCPT_YR)."""
     import requests
 
     if not api_key:
         raise ValueError("SEOUL_API_KEY가 설정되지 않았습니다.")
-    if year < 2006 or year > current_year() + 1:
-        raise ValueError(f"조회 연도가 올바르지 않습니다: {year}")
+    if receipt_year < 2006 or receipt_year > current_year() + 1:
+        raise ValueError(f"조회 접수연도가 올바르지 않습니다: {receipt_year}")
 
     client = session or requests.Session()
     rows: list[dict] = []
@@ -416,7 +445,7 @@ def fetch_api_data(
         end_index = start_index + page_size - 1
         url = (
             f"{API_BASE_URL}/{api_key}/json/{SERVICE_NAME}/"
-            f"{start_index}/{end_index}/{year}"
+            f"{start_index}/{end_index}/{receipt_year}"
         )
         try:
             response = client.get(url, timeout=timeout)
@@ -458,8 +487,10 @@ def fetch_api_data(
     return pd.DataFrame(rows)
 
 
-def year_data_path(base_dir: str | Path, year: int) -> Path:
-    return Path(base_dir) / "data" / DATA_FILENAME.format(year=year)
+def receipt_year_data_path(base_dir: str | Path, receipt_year: int) -> Path:
+    return Path(base_dir) / "data" / DATA_FILENAME.format(
+        receipt_year=receipt_year
+    )
 
 
 def update_metadata_path(base_dir: str | Path) -> Path:
@@ -493,20 +524,20 @@ def _atomic_write_json(payload: dict, path: Path) -> None:
     os.replace(temp_path, path)
 
 
-def save_year_data(
+def save_receipt_year_data(
     df: pd.DataFrame,
     base_dir: str | Path,
-    year: int,
+    receipt_year: int,
     *,
     fetched_count: int,
     snapshot_overlaps_removed: int = 0,
 ) -> dict:
-    output_path = year_data_path(base_dir, year)
+    output_path = receipt_year_data_path(base_dir, receipt_year)
     _atomic_write_csv(df, output_path)
 
     metadata = {
         "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "year": year,
+        "receipt_year": receipt_year,
         "fetched_count": int(fetched_count),
         "stored_count": int(len(df)),
         "within_snapshot_rows_removed": 0,
@@ -518,15 +549,19 @@ def save_year_data(
     return metadata
 
 
-def update_year_data(api_key: str, base_dir: str | Path, year: int) -> dict:
-    fetched = fetch_api_data(api_key, year)
-    existing_path = year_data_path(base_dir, year)
+def update_receipt_year_data(
+    api_key: str,
+    base_dir: str | Path,
+    receipt_year: int,
+) -> dict:
+    fetched = fetch_api_data(api_key, receipt_year)
+    existing_path = receipt_year_data_path(base_dir, receipt_year)
     existing = read_csv_file(existing_path) if existing_path.exists() else pd.DataFrame()
     combined, merge_duplicates = combine_raw_data([existing, fetched])
-    metadata = save_year_data(
+    metadata = save_receipt_year_data(
         combined,
         base_dir,
-        year,
+        receipt_year,
         fetched_count=len(fetched),
         snapshot_overlaps_removed=merge_duplicates,
     )
@@ -535,7 +570,7 @@ def update_year_data(api_key: str, base_dir: str | Path, year: int) -> dict:
 
 def build_data_status(
     df: pd.DataFrame,
-    year: int,
+    contract_year: int,
     *,
     today: dt.date | None = None,
 ) -> dict:
@@ -546,25 +581,36 @@ def build_data_status(
             "first_date": None,
             "last_date": None,
             "total_count": 0,
-            "current_year_count": 0,
+            "contract_year_count": 0,
             "month_counts": month_counts,
             "missing_past_months": list(range(1, today.month)),
         }
 
-    year_rows = df[df["CTRT_DAY"].dt.year == year]
-    counts = year_rows["CTRT_DAY"].dt.month.value_counts().to_dict()
-    if year < today.year:
+    contract_year_values = (
+        df["CONTRACT_YEAR"]
+        if "CONTRACT_YEAR" in df.columns
+        else df["CTRT_DAY"].dt.year
+    )
+    contract_month_values = (
+        df["CONTRACT_MONTH"]
+        if "CONTRACT_MONTH" in df.columns
+        else df["CTRT_DAY"].dt.month
+    )
+    year_mask = contract_year_values.eq(contract_year)
+    year_rows = df.loc[year_mask]
+    counts = contract_month_values.loc[year_mask].value_counts().to_dict()
+    if contract_year < today.year:
         final_month = 12
-    elif year == today.year:
+    elif contract_year == today.year:
         final_month = today.month
     else:
         final_month = 0
     month_counts = {month: int(counts.get(month, 0)) for month in range(1, final_month + 1)}
-    if year == today.year:
+    if contract_year == today.year:
         missing_past_months = [
             month for month in range(1, today.month) if month_counts.get(month, 0) == 0
         ]
-    elif year < today.year:
+    elif contract_year < today.year:
         missing_past_months = [
             month for month in range(1, 13) if month_counts.get(month, 0) == 0
         ]
@@ -575,7 +621,7 @@ def build_data_status(
         "first_date": df["CTRT_DAY"].min(),
         "last_date": df["CTRT_DAY"].max(),
         "total_count": int(len(df)),
-        "current_year_count": int(len(year_rows)),
+        "contract_year_count": int(len(year_rows)),
         "month_counts": month_counts,
         "missing_past_months": missing_past_months,
     }
