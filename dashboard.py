@@ -56,29 +56,50 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 @st.cache_data(ttl=3600)
-def fetch_2026_api_data(api_key, max_pages=5):
+def fetch_2026_api_data(api_key):
     if not api_key:
         return pd.DataFrame()
+
     service_name = "tbLnOpendataRtmsV"
     all_rows = []
-    
-    # Only fetch 2026 data live
-    for page in range(max_pages):
+    page = 0
+
+    while True:
         start_idx = (page * 1000) + 1
         end_idx = start_idx + 999
-        url = f"http://openapi.seoul.go.kr:8088/{api_key}/json/{service_name}/{start_idx}/{end_idx}/2026"
+
+        url = (
+            f"http://openapi.seoul.go.kr:8088/"
+            f"{api_key}/json/{service_name}/"
+            f"{start_idx}/{end_idx}/2026"
+        )
+
         try:
-            response = requests.get(url)
-            if response.status_code == 200:
-                data = response.json()
-                if service_name in data:
-                    rows = data[service_name]['row']
-                    all_rows.extend(rows)
-                    if len(rows) < 1000: break
-                else: break
-            else: break
-        except Exception: break
-            
+            response = requests.get(url, timeout=30)
+
+            if response.status_code != 200:
+                break
+
+            data = response.json()
+
+            if service_name not in data:
+                break
+
+            rows = data[service_name].get("row", [])
+
+            if not rows:
+                break
+
+            all_rows.extend(rows)
+
+            if len(rows) < 1000:
+                break
+
+            page += 1
+
+        except Exception:
+            break
+
     return pd.DataFrame(all_rows)
 
 @st.cache_data
