@@ -1,0 +1,59 @@
+name: Update Seoul real-estate data
+
+on:
+  schedule:
+    # 05:15 KST every day (20:15 UTC on the previous day)
+    - cron: "15 20 * * *"
+  workflow_dispatch:
+    inputs:
+      year:
+        description: "Contract year to update (blank = current year)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-seoul-real-estate-data
+  cancel-in-progress: false
+
+jobs:
+  update-data:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install updater dependencies
+        run: pip install -r requirements.txt
+
+      - name: Update current-year data
+        env:
+          SEOUL_API_KEY: ${{ secrets.SEOUL_API_KEY }}
+          UPDATE_YEAR: ${{ inputs.year }}
+        run: |
+          if [ -n "$UPDATE_YEAR" ]; then
+            python data_updater.py --year "$UPDATE_YEAR"
+          else
+            python data_updater.py
+          fi
+
+      - name: Commit updated data
+        run: |
+          if [ -z "$(git status --porcelain -- data)" ]; then
+            echo "No data changes to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data
+          git commit -m "chore(data): update Seoul real-estate transactions"
+          git push

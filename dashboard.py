@@ -1,37 +1,58 @@
-import streamlit as st
+from __future__ import annotations
+
+import datetime as dt
+import os
+import re
+from pathlib import Path
+
+import numpy as np
 import pandas as pd
 import plotly.express as px
-import datetime
-import os
-import requests
+import streamlit as st
 from dotenv import load_dotenv
 
-# Page config
+from analysis import (
+    build_monthly_trend,
+    build_watchlist_summary,
+    filter_complex_transactions,
+    load_watchlist,
+)
+from data_pipeline import (
+    build_data_status,
+    combine_raw_data,
+    current_year,
+    data_file_signatures,
+    fetch_api_data,
+    load_stored_raw_data,
+    preprocess_data,
+    read_update_metadata,
+)
+
+
+BASE_DIR = Path(__file__).resolve().parent
+WATCHLIST_PATH = BASE_DIR / "watchlist.csv"
+CURRENT_YEAR = current_year()
+
 st.set_page_config(page_title="서울 부동산 실거래가 실시간 분석", layout="wide")
 
-# Paths and Env
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# API Key Loading (Streamlit Cloud Secrets priority, then local .env)
-# In Streamlit Cloud, set SEOUL_API_KEY in "Advanced settings -> Secrets"
-if "SEOUL_API_KEY" in st.secrets:
-    API_KEY = st.secrets["SEOUL_API_KEY"]
-else:
-    # Local fallback: try to find .env in various levels
-    env_paths = [
-        os.path.join(BASE_DIR, ".env"),
-        os.path.join(BASE_DIR, "..", ".env"),
-        os.path.join(BASE_DIR, "..", "..", ".env"),
-        os.path.join(BASE_DIR, "..", "..", "..", ".env")
-    ]
-    for p in env_paths:
-        if os.path.exists(p):
-            load_dotenv(p)
-            break
-    API_KEY = os.getenv("SEOUL_API_KEY")
+def load_api_key() -> str:
+    """Prefer Streamlit Secrets and fall back to a local .env file."""
+    try:
+        secret_key = st.secrets.get("SEOUL_API_KEY", "")
+    except (FileNotFoundError, RuntimeError):
+        secret_key = ""
+    if secret_key:
+        return str(secret_key).strip()
 
-# Custom CSS for premium look
-st.markdown("""
+    load_dotenv(BASE_DIR / ".env")
+    return os.getenv("SEOUL_API_KEY", "").strip()
+
+
+API_KEY = load_api_key()
+
+st.markdown(
+    """
     <style>
     .main { background-color: #f8f9fa; }
     .stTabs [data-baseweb="tab-list"] { gap: 24px; }
@@ -53,298 +74,459 @@ st.markdown("""
         box-shadow: 0 2px 4px rgba(0,0,0,0.05);
     }
     </style>
-    """, unsafe_allow_html=True)
+    """,
+    unsafe_allow_html=True,
+)
 
-@st.cache_data(ttl=3600)
-def fetch_2026_api_data(api_key):
-    if not api_key:
-        return pd.DataFrame()
 
-    service_name = "tbLnOpendataRtmsV"
-    all_rows = []
-    page = 0
+def _minimum_file_year(signatures: tuple[tuple[str, int, int], ...]) -> int | None:
+    years = []
+    for path, _, _ in signatures:
+        match = re.search(r"seoul_real_estate_(\d{4})_", path)
+        if match:
+            years.append(int(match.group(1)))
+    return min(years) if years else None
 
-    while True:
-        start_idx = (page * 1000) + 1
-        end_idx = start_idx + 999
 
-        url = (
-            f"http://openapi.seoul.go.kr:8088/"
-            f"{api_key}/json/{service_name}/"
-            f"{start_idx}/{end_idx}/2026"
+@st.cache_data(show_spinner=False)
+def load_cached_stored_data(
+    signatures: tuple[tuple[str, int, int], ...],
+) -> tuple[pd.DataFrame, dict]:
+    # signatures is intentionally part of the cache key so a file update
+    # invalidates the cached DataFrame without relying on a fixed TTL.
+    raw = load_stored_raw_data(BASE_DIR)
+    return preprocess_data(raw, minimum_year=_minimum_file_year(signatures))
+
+
+@st.cache_data(ttl=3_600, show_spinner=False)
+def fetch_cached_api_data(api_key: str, year: int) -> pd.DataFrame:
+    return fetch_api_data(api_key, year)
+
+
+@st.cache_data(show_spinner=False)
+def load_cached_watchlist(path: str, modified_time_ns: int) -> pd.DataFrame:
+    del modified_time_ns
+    return load_watchlist(path)
+
+
+def format_date(value: object) -> str:
+    return value.strftime("%Y-%m-%d") if pd.notna(value) else "-"
+
+
+def format_update_time(metadata: dict) -> str:
+    raw_value = metadata.get("updated_at")
+    if not raw_value:
+        return "기록 없음"
+    try:
+        timestamp = pd.Timestamp(raw_value)
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.tz_localize("UTC")
+        return timestamp.tz_convert("Asia/Seoul").strftime("%Y-%m-%d %H:%M KST")
+    except (TypeError, ValueError):
+        return str(raw_value)
+
+
+def get_filtered_mega_data(df: pd.DataFrame, keywords: list[str]) -> pd.DataFrame:
+    pattern = "|".join(re.escape(keyword) for keyword in keywords)
+    mega = df[df["BLDG_NM"].str.contains(pattern, na=False)].copy()
+    if mega.empty:
+        return mega
+
+    def group_name(name: str) -> str:
+        return next((keyword for keyword in keywords if keyword in name), name)
+
+    mega["GROUP_NM"] = mega["BLDG_NM"].map(group_name)
+    mega["AREA_ROUND"] = mega["ARCH_AREA"].round(0)
+    selected = []
+    for name, group in mega.groupby("GROUP_NM", sort=False):
+        area_modes = group["AREA_ROUND"].mode()
+        if area_modes.empty:
+            continue
+        main_area = area_modes.iloc[0]
+        representative = group[group["AREA_ROUND"] == main_area].copy()
+        representative["MAIN_AREA"] = main_area
+        selected.append(representative)
+    return pd.concat(selected, ignore_index=True) if selected else pd.DataFrame()
+
+
+def render_monthly_chart(
+    transactions: pd.DataFrame,
+    *,
+    title_prefix: str,
+    key_prefix: str,
+) -> None:
+    trend = build_monthly_trend(transactions)
+    if trend.empty:
+        st.warning("선택한 단지의 월별 추세 데이터가 없습니다.")
+        return
+
+    metric = st.selectbox(
+        "추세 지표",
+        ["평균가", "중앙값", "거래건수", "㎡당 가격"],
+        key=f"{key_prefix}_trend_metric",
+    )
+    labels = {
+        "YEAR_MONTH": "계약년월",
+        "평균가": "평균 거래금액(억)",
+        "중앙값": "중앙 거래금액(억)",
+        "거래건수": "거래건수",
+        "㎡당 가격": "㎡당 평균가격(억)",
+    }
+    figure = px.line(
+        trend,
+        x="YEAR_MONTH",
+        y=metric,
+        markers=True,
+        labels=labels,
+        title=f"{title_prefix} 월별 {metric} 추이",
+        color_discrete_sequence=["#4A90E2"],
+    )
+    if metric in {"평균가", "중앙값", "㎡당 가격"} and len(trend) > 1:
+        x_values = np.arange(len(trend))
+        y_values = trend[metric].to_numpy(dtype=float)
+        valid = np.isfinite(y_values)
+        if valid.sum() > 1:
+            coefficients = np.polyfit(x_values[valid], y_values[valid], 1)
+            figure.add_scatter(
+                x=trend["YEAR_MONTH"],
+                y=np.poly1d(coefficients)(x_values),
+                mode="lines",
+                name="추세선",
+                line={"color": "red", "width": 2, "dash": "dot"},
+            )
+    st.plotly_chart(figure, width="stretch")
+    with st.expander("월별 집계표 보기"):
+        st.dataframe(
+            trend.style.format(
+                {"평균가": "{:.2f}", "중앙값": "{:.2f}", "㎡당 가격": "{:.3f}"},
+                na_rep="-",
+            ),
+            width="stretch",
         )
 
-        try:
-            response = requests.get(url, timeout=30)
 
-            if response.status_code != 200:
-                break
-
-            data = response.json()
-
-            if service_name not in data:
-                break
-
-            rows = data[service_name].get("row", [])
-
-            if not rows:
-                break
-
-            all_rows.extend(rows)
-
-            if len(rows) < 1000:
-                break
-
-            page += 1
-
-        except Exception:
-            break
-
-    return pd.DataFrame(all_rows)
-
-@st.cache_data
-def load_2025_csv():
-    filename = "seoul_real_estate_2025_부동산실거래가.csv"
-    
-    # Check multiple possible locations for deployment flexibility
-    possible_paths = [
-        os.path.join(BASE_DIR, filename),                      # Same folder as dashboard.py
-        os.path.join(BASE_DIR, "data", filename),              # Inside 'data' subdirectory
-        os.path.join(os.getcwd(), filename),                   # Root of the repo
-        os.path.join(os.getcwd(), "data", filename),           # 'data' folder at root
-        # Local fallback for your specific machine
-        r'c:\Users\ehdwn\Desktop\업로드 필요\OneDrive\Study\Fastcamp\ICB6\T_Choi\Procjet1\Real_Estate_Data_Analysis\data\korea\data\seoul_real_estate_2025_부동산실거래가.csv'
-    ]
-    
-    found_path = None
-    for p in possible_paths:
-        if os.path.exists(p):
-            found_path = p
-            break
-            
-    if found_path:
-        try:
-            return pd.read_csv(found_path, encoding='utf-8')
-        except:
-            return pd.read_csv(found_path, encoding='cp949')
-    
-    st.error(f"⚠️ 데이터를 찾을 수 없습니다. (파일명: {filename})")
-    st.info(f"현재 위치({os.getcwd()})와 그 하위 폴더를 확인해 주세요.")
-    return pd.DataFrame()
-
-@st.cache_data
-def load_local_data():
-    # Try loading both years locally
-    df25 = load_2025_csv()
-    
-    file_path_26 = os.path.join(BASE_DIR, "data", "seoul_real_estate_2026_부동산실거래가.csv")
-    if not os.path.exists(file_path_26):
-        file_path_26 = os.path.join(BASE_DIR, "data", "korea", "data", "seoul_real_estate_2026_부동산실거래가.csv")
-        
-    dfs = [df25]
-    if os.path.exists(file_path_26):
-        try:
-            df26 = pd.read_csv(file_path_26, encoding='utf-8')
-            dfs.append(df26)
-        except:
-            df26 = pd.read_csv(file_path_26, encoding='cp949')
-            dfs.append(df26)
-            
-    return pd.concat(dfs, ignore_index=True)
-
-def preprocess_data(df):
-    if df.empty: return df
-    df['CTRT_DAY'] = pd.to_datetime(df['CTRT_DAY'], format='%Y%m%d', errors='coerce')
-    df = df.dropna(subset=['CTRT_DAY'])
-    df = df[df['CTRT_DAY'] >= '2025-01-01']
-    df['THING_AMT'] = pd.to_numeric(df['THING_AMT'], errors='coerce')
-    df['THING_AMT'] = df['THING_AMT'] / 10000.0
-    return df
-
-# Sidebar for Setup
 st.sidebar.title("🛠️ 데이터 옵션")
-option = st.sidebar.radio("데이터 모드", ["로컬 (25'CSV) + 실시간 (26'API)", "전체 로컬 모드"])
-
-refresh = st.sidebar.button("🔄 데이터 새로고침")
-if refresh:
+data_mode = st.sidebar.radio(
+    "데이터 모드",
+    ["저장 파일 우선 (권장)", f"저장 파일 + {CURRENT_YEAR}년 API"],
+    help="API 모드는 명시적으로 선택했을 때만 현재연도 전체 데이터를 가져옵니다.",
+)
+if st.sidebar.button("🔄 파일·캐시 새로고침"):
     st.cache_data.clear()
+    st.rerun()
 
-if option == "로컬 (25'CSV) + 실시간 (26'API)":
-    with st.spinner("2025년 데이터 로드 중..."):
-        df25 = load_2025_csv()
-    
-    if API_KEY:
-        with st.spinner("2026년 실시간 데이터 수집 중..."):
-            df26 = fetch_2026_api_data(API_KEY)
-            df_raw = pd.concat([df25, df26], ignore_index=True)
-            st.sidebar.success(f"2026년 데이터 {len(df26)}건 추가됨")
+file_signatures = data_file_signatures(BASE_DIR)
+with st.spinner("저장된 실거래 데이터를 불러오는 중입니다..."):
+    df, quality = load_cached_stored_data(file_signatures)
+
+if data_mode.endswith("년 API"):
+    if not API_KEY:
+        st.sidebar.error("SEOUL_API_KEY가 없어 저장 파일만 표시합니다.")
     else:
-        st.sidebar.error("API 키가 없습니다. 2025년 데이터만 표시합니다.")
-        df_raw = df25
-else:
-    with st.spinner("로컬 파일 로드 중..."):
-        df_raw = load_local_data()
+        with st.spinner(f"{CURRENT_YEAR}년 API 전체 데이터를 가져오는 중입니다..."):
+            try:
+                api_raw = fetch_cached_api_data(API_KEY, CURRENT_YEAR)
+                stored_raw = load_stored_raw_data(BASE_DIR)
+                combined_raw, snapshot_overlaps = combine_raw_data([stored_raw, api_raw])
+                df, quality = preprocess_data(
+                    combined_raw,
+                    minimum_year=_minimum_file_year(file_signatures) or CURRENT_YEAR,
+                )
+                st.sidebar.success(
+                    f"{CURRENT_YEAR}년 API {len(api_raw):,}건 병합 · "
+                    f"스냅샷 겹침 {snapshot_overlaps:,}건 제외"
+                )
+            except Exception as exc:
+                st.sidebar.error(f"API 수집 실패: {exc}")
 
-df = preprocess_data(df_raw)
-
-# UI Starts
 st.title("🏙️ 서울 부동산 실거래가 분석 대시보드")
-if not df.empty:
-    st.info(f"데이터 기준일: {df['CTRT_DAY'].max().strftime('%Y-%m-%d')} | 전체 데이터: {len(df):,}건")
-else:
-    st.error("데이터를 불러올 수 없습니다.")
+if df.empty:
+    st.error("표시할 실거래 데이터를 찾지 못했습니다.")
     st.stop()
 
-tab1, tab2 = st.tabs(["📊 10대 대단지 현황", "🏠 태강아파트 (공릉동)"])
+watchlist = load_cached_watchlist(str(WATCHLIST_PATH), WATCHLIST_PATH.stat().st_mtime_ns)
+metadata = read_update_metadata(BASE_DIR)
+status = build_data_status(df, CURRENT_YEAR)
 
-# Defined Top 10 Mega Complexes
+status_columns = st.columns(5)
+status_columns[0].metric("데이터 최초일", format_date(status["first_date"]))
+status_columns[1].metric("데이터 기준일", format_date(status["last_date"]))
+status_columns[2].metric("전체 거래건수", f"{status['total_count']:,}건")
+status_columns[3].metric(f"{CURRENT_YEAR}년 거래건수", f"{status['current_year_count']:,}건")
+status_columns[4].metric("마지막 자동 업데이트", format_update_time(metadata))
+
+if quality["potential_repeated_rows"]:
+    st.caption(
+        f"동일 공개 속성 반복 {quality['potential_repeated_rows']:,}건은 "
+        "별도 호실 거래일 수 있어 보존했습니다."
+    )
+
+if status["missing_past_months"]:
+    missing_labels = ", ".join(
+        f"{CURRENT_YEAR}년 {month}월" for month in status["missing_past_months"]
+    )
+    st.warning(
+        f"⚠️ 이미 지난 월 중 데이터가 없는 기간: {missing_labels}. "
+        "GitHub Actions 실행 상태와 데이터 파일을 확인하세요."
+    )
+
+with st.sidebar.expander(f"📋 {CURRENT_YEAR}년 월별 데이터 상태", expanded=True):
+    month_status = pd.DataFrame(
+        {
+            "계약월": [f"{CURRENT_YEAR}-{month:02d}" for month in status["month_counts"]],
+            "거래건수": list(status["month_counts"].values()),
+        }
+    )
+    st.dataframe(month_status, hide_index=True, width="stretch")
+    st.caption(f"전처리 중 제외된 날짜 오류: {quality['invalid_dates']:,}건")
+
+tabs = st.tabs(
+    ["📊 10대 대단지 현황", "🏠 태강아파트 (공릉동)", "🔁 관심단지 비교"]
+)
+
 mega_complexes_keywords = [
-    '헬리오시티', '파크리오', '잠실엘스', '리센츠', '고덕그라시움', 
-    '고덕아르테온', '올림픽선수기자촌', '센트라스', '마포래미안푸르지오', '올림픽파크포레온'
+    "헬리오시티",
+    "파크리오",
+    "잠실엘스",
+    "리센츠",
+    "고덕그라시움",
+    "고덕아르테온",
+    "올림픽선수기자촌",
+    "센트라스",
+    "마포래미안푸르지오",
+    "올림픽파크포레온",
 ]
-
-def get_filtered_mega_data(df, keywords):
-    pattern = '|'.join(keywords)
-    m_df = df[df['BLDG_NM'].str.contains(pattern, na=False)].copy()
-    
-    def get_group_name(name):
-        for k in keywords:
-            if k in name: return k
-        return name
-    
-    m_df['GROUP_NM'] = m_df['BLDG_NM'].apply(get_group_name)
-    m_df['AREA_ROUND'] = m_df['ARCH_AREA'].round(0)
-    
-    # Filter each group by its most frequent area (Mode)
-    final_dfs = []
-    for g_name in m_df['GROUP_NM'].unique():
-        group = m_df[m_df['GROUP_NM'] == g_name]
-        main_area = group['AREA_ROUND'].mode()[0]
-        # Keep only records matching the main area (within +/- 2 range for safety)
-        group_filtered = group[group['AREA_ROUND'] == main_area].copy()
-        group_filtered['MAIN_AREA'] = main_area
-        final_dfs.append(group_filtered)
-    
-    return pd.concat(final_dfs, ignore_index=True) if final_dfs else pd.DataFrame()
-
 mega_filtered = get_filtered_mega_data(df, mega_complexes_keywords)
 
-with tab1:
+with tabs[0]:
     st.header("서울 10대 대단지 주력 평형 분석")
-    st.caption("※ 각 단지별로 가장 거래가 많은 대표 평형(Area) 데이터만을 추출하여 비교합니다.")
-    
+    st.caption("각 단지에서 거래가 가장 많은 대표 전용면적 데이터를 비교합니다.")
     if mega_filtered.empty:
-        st.warning("분석할 단지 데이터가 없습니다.")
+        st.warning("분석할 10대 단지 데이터가 없습니다.")
     else:
-        col1, col2 = st.columns([1, 1])
-        
-        with col1:
+        left, right = st.columns([1, 1])
+        with left:
             st.subheader("📅 주력 평형별 최신 실거래")
-            display_cols = ['CTRT_DAY', 'GROUP_NM', 'MAIN_AREA', 'THING_AMT', 'FLR']
-            recent_mega = mega_filtered.sort_values('CTRT_DAY', ascending=False).head(50)
-            st.dataframe(recent_mega[display_cols].rename(columns={
-                'CTRT_DAY': '계약일', 'GROUP_NM': '단지명', 'MAIN_AREA': '평형(㎡)',
-                'THING_AMT': '거래금액(억)', 'FLR': '층'
-            }), use_container_width=True, height=450)
-
-        with col2:
+            recent = mega_filtered.sort_values("CTRT_DAY", ascending=False).head(50)
+            display_columns = ["CTRT_DAY", "GROUP_NM", "MAIN_AREA", "THING_AMT", "FLR"]
+            st.dataframe(
+                recent[display_columns].rename(
+                    columns={
+                        "CTRT_DAY": "계약일",
+                        "GROUP_NM": "단지명",
+                        "MAIN_AREA": "대표면적(㎡)",
+                        "THING_AMT": "거래금액(억)",
+                        "FLR": "층",
+                    }
+                ),
+                width="stretch",
+                height=450,
+            )
+        with right:
             st.subheader("📈 주력 평형 평균 가격 추이")
-            mega_filtered['YEAR_MONTH'] = mega_filtered['CTRT_DAY'].dt.to_period('M').astype(str)
-            m_trend = mega_filtered.groupby(['YEAR_MONTH', 'GROUP_NM'])['THING_AMT'].mean().reset_index()
-            
-            fig = px.line(m_trend, x='YEAR_MONTH', y='THING_AMT', color='GROUP_NM',
-                         labels={'THING_AMT': '평균 거래금액(억)', 'YEAR_MONTH': '계약년월'},
-                         title="단지별 대표 평형 가격 변동", markers=True)
-            st.plotly_chart(fig, use_container_width=True)
+            mega_trend = (
+                mega_filtered.groupby(["YEAR_MONTH", "GROUP_NM"], as_index=False)[
+                    "THING_AMT"
+                ].mean()
+            )
+            figure = px.line(
+                mega_trend,
+                x="YEAR_MONTH",
+                y="THING_AMT",
+                color="GROUP_NM",
+                labels={"THING_AMT": "평균 거래금액(억)", "YEAR_MONTH": "계약년월"},
+                title="단지별 대표 평형 가격 변동",
+                markers=True,
+            )
+            st.plotly_chart(figure, width="stretch")
 
         st.markdown("---")
         st.subheader("🏢 단지별 대표 평형 요약")
-        m_stats = mega_filtered.groupby(['GROUP_NM', 'MAIN_AREA']).agg({
-            'THING_AMT': ['count', 'mean', 'max', 'min']
-        }).reset_index()
-        m_stats.columns = ['단지명', '대표평형(㎡)', '거래건수', '평균가(억)', '최고가(억)', '최소가(억)']
-        st.table(m_stats.style.format({
-            '평균가(억)': '{:.2f}', '최고가(억)': '{:.2f}', '최소가(억)': '{:.2f}'
-        }))
+        mega_stats = (
+            mega_filtered.groupby(["GROUP_NM", "MAIN_AREA"], as_index=False)
+            .agg(
+                거래건수=("THING_AMT", "size"),
+                평균가_억=("THING_AMT", "mean"),
+                최고가_억=("THING_AMT", "max"),
+                최저가_억=("THING_AMT", "min"),
+            )
+            .rename(columns={"GROUP_NM": "단지명", "MAIN_AREA": "대표면적(㎡)"})
+        )
+        st.dataframe(
+            mega_stats.style.format(
+                {"평균가_억": "{:.2f}", "최고가_억": "{:.2f}", "최저가_억": "{:.2f}"}
+            ),
+            width="stretch",
+            hide_index=True,
+        )
 
-with tab2:
+with tabs[1]:
     st.header("노원구 공릉동 태강아파트 상세분석")
-    
-    # Area filter UI
-    area_choice = st.radio("🏠 평형 선택", ["49㎡ 타입", "59㎡ 타입"], horizontal=True)
-    # 49.6 rounds to 50, so let's use range or specific rounding that matches user expectation
-    # Most people call 49.60 as "49 type" or "21 pyuong". 
-    # Let's use int() or floor() so 49.6 -> 49
-    target_area = 49 if "49" in area_choice else 59
-    
-    taegang_df = df[df['BLDG_NM'].str.contains('태강', na=False)].copy()
-    # Use floor to capture 49.x as 49
-    taegang_df['AREA_INT'] = taegang_df['ARCH_AREA'].astype(int)
-    taegang_filtered = taegang_df[taegang_df['AREA_INT'] == target_area].copy()
-    
-    if taegang_filtered.empty:
-        st.warning(f"{target_area}㎡ 타입의 거래 내역이 선택된 데이터 범위 내에 없습니다.")
-        # Fallback check: maybe it rounds higher?
-        alt_area = 50 if target_area == 49 else 60
-        alt_filtered = taegang_df[taegang_df['AREA_INT'] == alt_area].copy()
-        if not alt_filtered.empty:
-            st.info(f"참고: {target_area}㎡ 대신 {alt_area}㎡(실제 {alt_filtered['ARCH_AREA'].iloc[0]}㎡) 데이터를 표시합니다.")
-            taegang_filtered = alt_filtered
-            target_area = alt_area
+    taegang_config = watchlist[watchlist["display_name"] == "태강아파트"].iloc[0]
+    taegang = filter_complex_transactions(df, taegang_config)
 
-    if not taegang_filtered.empty:
+    area_choice = st.radio("🏠 평형 선택", ["49㎡ 타입", "59㎡ 타입"], horizontal=True)
+    target_area = 49 if area_choice.startswith("49") else 59
+    taegang["AREA_INT"] = taegang["ARCH_AREA"].astype("Int64")
+    selected_taegang = taegang[taegang["AREA_INT"] == target_area].copy()
+
+    if selected_taegang.empty:
+        st.warning(f"{target_area}㎡ 타입의 거래 내역이 선택한 데이터 범위에 없습니다.")
+    else:
         st.info(f"📍 태강아파트 {target_area}㎡ 타입 분석 결과")
-        colA, colB = st.columns([1, 1])
-        with colA:
+        left, right = st.columns([1, 1])
+        with left:
             st.subheader("📅 실거래 내역")
-            t_display = taegang_filtered.sort_values('CTRT_DAY', ascending=False)
-            st.dataframe(t_display[['CTRT_DAY', 'THING_AMT', 'ARCH_AREA', 'FLR']].rename(columns={
-                'CTRT_DAY': '계약일', 'THING_AMT': '거래금액(억)', 'ARCH_AREA': '전용면적(㎡)', 'FLR': '층'
-            }), use_container_width=True, height=450)
-            
-        with colB:
-            st.subheader("📈 거래가격 추세")
-            taegang_filtered['YEAR_MONTH'] = taegang_filtered['CTRT_DAY'].dt.to_period('M').astype(str)
-            t_monthly = taegang_filtered.groupby('YEAR_MONTH')['THING_AMT'].mean().reset_index()
-            t_monthly = t_monthly.sort_values('YEAR_MONTH')
-            
-            # Main Line Chart
-            fig_t = px.line(t_monthly, x='YEAR_MONTH', y='THING_AMT', 
-                          title=f"태강 {target_area}㎡ 월별 평균가 추이",
-                          markers=True,
-                          color_discrete_sequence=['#4A90E2'])
-            
-            # Add Trendline (Simple Linear Regression)
-            if len(t_monthly) > 1:
-                import numpy as np
-                x = np.arange(len(t_monthly))
-                y = t_monthly['THING_AMT'].values
-                z = np.polyfit(x, y, 1)
-                p = np.poly1d(z)
-                
-                fig_t.add_scatter(x=t_monthly['YEAR_MONTH'], y=p(x), 
-                                 mode='lines', 
-                                 name='가격 추세선',
-                                 line=dict(color='red', width=2, dash='dot'))
-                
-            st.plotly_chart(fig_t, use_container_width=True)
-        
+            detail = selected_taegang.sort_values("CTRT_DAY", ascending=False)
+            st.dataframe(
+                detail[["CTRT_DAY", "THING_AMT", "ARCH_AREA", "FLR"]].rename(
+                    columns={
+                        "CTRT_DAY": "계약일",
+                        "THING_AMT": "거래금액(억)",
+                        "ARCH_AREA": "전용면적(㎡)",
+                        "FLR": "층",
+                    }
+                ),
+                width="stretch",
+                height=450,
+            )
+        with right:
+            st.subheader("📈 가격 추세")
+            render_monthly_chart(
+                selected_taegang,
+                title_prefix=f"태강 {target_area}㎡",
+                key_prefix="taegang",
+            )
+
         st.markdown("---")
-        st.subheader("🔍 층별 거래 분포 (산점도)")
-        fig_scat = px.scatter(taegang_filtered, x='CTRT_DAY', y='THING_AMT', color='FLR',
-                               labels={'CTRT_DAY': '계약일', 'THING_AMT': '거래금액(억)', 'FLR': '층'},
-                               hover_data=['ARCH_AREA'],
-                               title=f"{target_area}㎡ 거래 상세 분포")
-        st.plotly_chart(fig_scat, use_container_width=True)
+        st.subheader("🔍 층별 거래 분포")
+        scatter = px.scatter(
+            selected_taegang,
+            x="CTRT_DAY",
+            y="THING_AMT",
+            color="FLR",
+            labels={"CTRT_DAY": "계약일", "THING_AMT": "거래금액(억)", "FLR": "층"},
+            hover_data=["ARCH_AREA"],
+            title=f"{target_area}㎡ 거래 상세 분포",
+        )
+        st.plotly_chart(scatter, width="stretch")
+
+with tabs[2]:
+    st.header("관심단지 갈아타기 비교")
+    as_of = pd.Timestamp(status["last_date"])
+    summary = build_watchlist_summary(df, watchlist, as_of)
+    reference = summary[summary["단지명"] == "태강아파트"].iloc[0]
+    candidates = summary[summary["단지명"] != "태강아파트"]
+    valid_gaps = pd.to_numeric(candidates["태강 대비 GAP"], errors="coerce").dropna()
+    gap_changes = pd.to_numeric(candidates["GAP 변화"], errors="coerce")
+
+    st.caption(f"데이터 기준일 {as_of.strftime('%Y-%m-%d')} · 가격 단위 억원")
+    metric_columns = st.columns(3)
+    metric_columns[0].metric(
+        "태강 기준가격",
+        f"{reference['기준가격']:.2f}억" if pd.notna(reference["기준가격"]) else "-",
+        help=str(reference["기준가격 유형"]),
+    )
+    metric_columns[1].metric(
+        "관심단지 평균 GAP",
+        f"{valid_gaps.mean():.2f}억" if not valid_gaps.empty else "-",
+    )
+    metric_columns[2].metric("GAP 축소 단지 수", f"{int((gap_changes < 0).sum())}곳")
+
+    st.subheader("관심단지 비교표")
+    comparison_columns = [
+        "단지명",
+        "최근 실거래가",
+        "최근 거래일",
+        "3개월 평균가",
+        "3개월 중앙값",
+        "6개월 평균가",
+        "6개월 중앙값",
+        "3개월 거래건수",
+        "6개월 거래건수",
+        "1년 최고가",
+        "1년 최저가",
+        "㎡당 거래가격",
+        "기준가격 유형",
+        "태강 대비 GAP",
+        "3개월 전 GAP",
+        "GAP 변화",
+        "GAP 방향",
+    ]
+    comparison = summary[comparison_columns].copy()
+    comparison["최근 거래일"] = comparison["최근 거래일"].map(format_date)
+    money_columns = [
+        "최근 실거래가",
+        "3개월 평균가",
+        "3개월 중앙값",
+        "6개월 평균가",
+        "6개월 중앙값",
+        "1년 최고가",
+        "1년 최저가",
+        "태강 대비 GAP",
+        "3개월 전 GAP",
+        "GAP 변화",
+    ]
+    st.dataframe(
+        comparison.style.format(
+            {**{column: "{:.2f}" for column in money_columns}, "㎡당 거래가격": "{:.3f}"},
+            na_rep="-",
+        ),
+        width="stretch",
+        hide_index=True,
+    )
+
+    st.subheader("태강 대비 현재 GAP")
+    gap_chart_data = candidates.dropna(subset=["태강 대비 GAP"]).copy()
+    if gap_chart_data.empty:
+        st.warning("GAP을 계산할 수 있는 관심단지 거래가 없습니다.")
+    else:
+        gap_figure = px.bar(
+            gap_chart_data,
+            x="단지명",
+            y="태강 대비 GAP",
+            color="GAP 변화",
+            color_continuous_scale="RdYlGn_r",
+            labels={"태강 대비 GAP": "태강 대비 GAP(억)", "GAP 변화": "3개월 대비 변화(억)"},
+            title="후보단지 기준가격 - 태강 기준가격",
+        )
+        st.plotly_chart(gap_figure, width="stretch")
+
+    st.subheader("단지별 가격 추세")
+    selected_name = st.selectbox("관심단지 선택", watchlist["display_name"].tolist())
+    selected_config = watchlist[watchlist["display_name"] == selected_name].iloc[0]
+    selected_transactions = filter_complex_transactions(df, selected_config)
+    render_monthly_chart(
+        selected_transactions,
+        title_prefix=selected_name,
+        key_prefix="watchlist",
+    )
+
+    st.subheader("상세 거래내역")
+    if selected_transactions.empty:
+        st.info(f"{selected_name}의 거래 데이터가 없습니다.")
+    else:
+        details = selected_transactions.sort_values("CTRT_DAY", ascending=False)[
+            ["CTRT_DAY", "BLDG_NM", "THING_AMT", "ARCH_AREA", "FLR", "CGG_NM", "STDG_NM"]
+        ].rename(
+            columns={
+                "CTRT_DAY": "계약일",
+                "BLDG_NM": "API 단지명",
+                "THING_AMT": "거래금액(억)",
+                "ARCH_AREA": "전용면적(㎡)",
+                "FLR": "층",
+                "CGG_NM": "자치구",
+                "STDG_NM": "법정동",
+            }
+        )
+        st.dataframe(details, width="stretch", hide_index=True)
 
 st.sidebar.markdown("---")
-st.sidebar.info("""
-**실시간 API 모드 안내**:
-- 최근 2,000건의 데이터를 우선적으로 가져옵니다.
-- 2025년 최신 실거래가를 즉시 반영할 수 있습니다.
-- 데이터 로딩이 느릴 경우 '로컬 CSV' 모드를 사용하세요.
-""")
-
-# Note: THING_AMT in raw data is often in 10,000 KRW.
-# If original data is 56000, then it's 5.6 Eok.
-# The division by 10000.0 is used to show it in Eok.
+st.sidebar.info(
+    """
+**데이터 갱신 안내**
+- 기본 모드는 저장된 CSV만 읽습니다.
+- GitHub Actions가 하루 1회 현재연도 파일을 갱신합니다.
+- API 모드는 필요할 때만 명시적으로 선택하세요.
+"""
+)
