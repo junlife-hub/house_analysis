@@ -12,13 +12,16 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from analysis import (
+    build_area_group_summary,
     build_monthly_trend,
     build_watchlist_summary,
+    filter_area_group,
     filter_complex_transactions,
     load_watchlist,
 )
 from data_pipeline import (
     DEFAULT_ANALYSIS_START_DATE,
+    assign_area_group,
     build_effective_transactions,
     build_data_status,
     combine_raw_data,
@@ -95,6 +98,7 @@ def load_cached_stored_data(
         raw, analysis_start_date=ANALYSIS_START_DATE
     )
     effective, cancellation_quality = build_effective_transactions(prepared)
+    effective = assign_area_group(effective)
     return effective, {**quality, **cancellation_quality}
 
 
@@ -136,14 +140,13 @@ def get_filtered_mega_data(df: pd.DataFrame, keywords: list[str]) -> pd.DataFram
         return next((keyword for keyword in keywords if keyword in name), name)
 
     mega["GROUP_NM"] = mega["BLDG_NM"].map(group_name)
-    mega["AREA_ROUND"] = mega["ARCH_AREA"].round(0)
     selected = []
     for name, group in mega.groupby("GROUP_NM", sort=False):
-        area_modes = group["AREA_ROUND"].mode()
+        area_modes = group["AREA_GROUP"].dropna().mode()
         if area_modes.empty:
             continue
         main_area = area_modes.iloc[0]
-        representative = group[group["AREA_ROUND"] == main_area].copy()
+        representative = group[group["AREA_GROUP"] == main_area].copy()
         representative["MAIN_AREA"] = main_area
         selected.append(representative)
     return pd.concat(selected, ignore_index=True) if selected else pd.DataFrame()
@@ -236,6 +239,7 @@ if data_mode == api_mode_label:
                     analysis_start_date=ANALYSIS_START_DATE,
                 )
                 df, cancellation_quality = build_effective_transactions(prepared)
+                df = assign_area_group(df)
                 quality = {**quality, **cancellation_quality}
                 st.sidebar.success(
                     f"{CURRENT_RECEIPT_YEAR}년 접수 API {len(api_raw):,}건 병합 · "
@@ -335,7 +339,7 @@ with tabs[0]:
                     columns={
                         "CTRT_DAY": "계약일",
                         "GROUP_NM": "단지명",
-                        "MAIN_AREA": "대표면적(㎡)",
+                        "MAIN_AREA": "대표 면적그룹",
                         "THING_AMT": "거래금액(억)",
                         "FLR": "층",
                     }
@@ -376,7 +380,7 @@ with tabs[0]:
                 최고가_억=("THING_AMT", "max"),
                 최저가_억=("THING_AMT", "min"),
             )
-            .rename(columns={"GROUP_NM": "단지명", "MAIN_AREA": "대표면적(㎡)"})
+            .rename(columns={"GROUP_NM": "단지명", "MAIN_AREA": "대표 면적그룹"})
         )
         st.dataframe(
             mega_stats.style.format(
@@ -391,15 +395,14 @@ with tabs[1]:
     taegang_config = watchlist[watchlist["display_name"] == "태강아파트"].iloc[0]
     taegang = filter_complex_transactions(df, taegang_config)
 
-    area_choice = st.radio("🏠 평형 선택", ["49㎡ 타입", "59㎡ 타입"], horizontal=True)
-    target_area = 49 if area_choice.startswith("49") else 59
-    taegang["AREA_INT"] = taegang["ARCH_AREA"].astype("Int64")
-    selected_taegang = taegang[taegang["AREA_INT"] == target_area].copy()
+    taegang_area_groups = build_area_group_summary(taegang)["AREA_GROUP"].tolist()
+    area_choice = st.radio("🏠 전용면적 그룹 선택", taegang_area_groups, horizontal=True)
+    selected_taegang = filter_area_group(taegang, area_choice)
 
     if selected_taegang.empty:
-        st.warning(f"{target_area}㎡ 타입의 거래 내역이 선택한 데이터 범위에 없습니다.")
+        st.warning(f"{area_choice}의 거래 내역이 선택한 데이터 범위에 없습니다.")
     else:
-        st.info(f"📍 태강아파트 {target_area}㎡ 타입 분석 결과")
+        st.info(f"📍 태강아파트 {area_choice} 분석 결과")
         left, right = st.columns([1, 1])
         with left:
             st.subheader("📅 실거래 내역")
@@ -420,7 +423,7 @@ with tabs[1]:
             st.subheader("📈 가격 추세")
             render_monthly_chart(
                 selected_taegang,
-                title_prefix=f"태강 {target_area}㎡",
+                title_prefix=f"태강 {area_choice}",
                 key_prefix="taegang",
             )
 
@@ -433,7 +436,7 @@ with tabs[1]:
             color="FLR",
             labels={"CTRT_DAY": "계약일", "THING_AMT": "거래금액(억)", "FLR": "층"},
             hover_data=["ARCH_AREA"],
-            title=f"{target_area}㎡ 거래 상세 분포",
+            title=f"{area_choice} 거래 상세 분포",
         )
         st.plotly_chart(scatter, width="stretch")
 
@@ -518,13 +521,74 @@ with tabs[2]:
         )
         st.plotly_chart(gap_figure, width="stretch")
 
-    st.subheader("단지별 가격 추세")
+    st.subheader("단지별·전용면적 그룹 가격 추세")
     selected_name = st.selectbox("관심단지 선택", watchlist["display_name"].tolist())
     selected_config = watchlist[watchlist["display_name"] == selected_name].iloc[0]
-    selected_transactions = filter_complex_transactions(df, selected_config)
+    complex_transactions = filter_complex_transactions(df, selected_config)
+    area_summary = build_area_group_summary(complex_transactions)
+    if not area_summary.empty:
+        area_overview = area_summary[
+            [
+                "AREA_GROUP",
+                "AREA_VALUES",
+                "TRANSACTION_COUNT",
+                "LATEST_CONTRACT_DATE",
+                "LATEST_PRICE",
+            ]
+        ].copy()
+        area_overview["AREA_VALUES"] = area_overview["AREA_VALUES"].map(
+            lambda values: ", ".join(f"{value:g}" for value in values)
+        )
+        st.dataframe(
+            area_overview.rename(
+                columns={
+                    "AREA_GROUP": "면적그룹",
+                    "AREA_VALUES": "원본 전용면적(㎡)",
+                    "TRANSACTION_COUNT": "거래건수",
+                    "LATEST_CONTRACT_DATE": "최근 거래일",
+                    "LATEST_PRICE": "최근 거래가(억)",
+                }
+            ).style.format({"최근 거래가(억)": "{:.2f}"}),
+            width="stretch",
+            hide_index=True,
+        )
+    area_options = ["전체", *area_summary["AREA_GROUP"].tolist()]
+    selected_area_group = st.selectbox(
+        "전용면적 그룹",
+        area_options,
+        key="watchlist_area_group",
+    )
+    selected_transactions = filter_area_group(
+        complex_transactions,
+        selected_area_group,
+    )
+    scope_label = (
+        selected_name
+        if selected_area_group == "전체"
+        else f"{selected_name} {selected_area_group}"
+    )
+    if not selected_transactions.empty:
+        latest = selected_transactions.sort_values(
+            "CTRT_DAY", kind="stable"
+        ).iloc[-1]
+        scope_metrics = st.columns(6)
+        scope_metrics[0].metric("거래건수", f"{len(selected_transactions):,}건")
+        scope_metrics[1].metric("최근 거래일", format_date(latest["CTRT_DAY"]))
+        scope_metrics[2].metric("최근 거래가", f"{latest['THING_AMT']:.2f}억")
+        scope_metrics[3].metric(
+            "평균가", f"{selected_transactions['THING_AMT'].mean():.2f}억"
+        )
+        scope_metrics[4].metric(
+            "중앙값", f"{selected_transactions['THING_AMT'].median():.2f}억"
+        )
+        scope_metrics[5].metric(
+            "최저~최고",
+            f"{selected_transactions['THING_AMT'].min():.2f}~"
+            f"{selected_transactions['THING_AMT'].max():.2f}억",
+        )
     render_monthly_chart(
         selected_transactions,
-        title_prefix=selected_name,
+        title_prefix=scope_label,
         key_prefix="watchlist",
     )
 
@@ -533,11 +597,21 @@ with tabs[2]:
         st.info(f"{selected_name}의 거래 데이터가 없습니다.")
     else:
         details = selected_transactions.sort_values("CTRT_DAY", ascending=False)[
-            ["CTRT_DAY", "BLDG_NM", "THING_AMT", "ARCH_AREA", "FLR", "CGG_NM", "STDG_NM"]
+            [
+                "CTRT_DAY",
+                "BLDG_NM",
+                "AREA_GROUP",
+                "THING_AMT",
+                "ARCH_AREA",
+                "FLR",
+                "CGG_NM",
+                "STDG_NM",
+            ]
         ].rename(
             columns={
                 "CTRT_DAY": "계약일",
                 "BLDG_NM": "API 단지명",
+                "AREA_GROUP": "면적그룹",
                 "THING_AMT": "거래금액(억)",
                 "ARCH_AREA": "전용면적(㎡)",
                 "FLR": "층",

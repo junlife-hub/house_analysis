@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Iterable
 
+import numpy as np
 import pandas as pd
 
 if TYPE_CHECKING:
@@ -18,6 +19,7 @@ API_BASE_URL = "http://openapi.seoul.go.kr:8088"
 DATA_FILENAME = "seoul_real_estate_{receipt_year}_부동산실거래가.csv"
 UPDATE_METADATA_FILENAME = "last_update.json"
 DEFAULT_ANALYSIS_START_DATE = dt.date(2025, 1, 1)
+AREA_GROUP_WIDTH_SQM = 1.0
 
 # The Seoul API does not expose a transaction ID or a unit/호 number. These are
 # the complete fields currently available in the CSV. They can match snapshots,
@@ -284,6 +286,32 @@ def preprocess_data(
         "potential_repeated_rows": repeated_count,
         "match_columns": key_columns,
     }
+
+
+def assign_area_group(df: pd.DataFrame) -> pd.DataFrame:
+    """Add conservative analysis-only area groups without changing ARCH_AREA.
+
+    Korean apartment types conventionally use the lower whole-square-metre
+    nominal value (for example, 59.21 and 59.79 are both 59㎡ types).  Values
+    are therefore assigned to explicit 1㎡ half-open intervals: [59, 60),
+    [84, 85), and so on.  Areas across an integer boundary are deliberately
+    not merged because the public data does not say whether they are the same
+    floor plan.
+    """
+    grouped = df.copy()
+    if "ARCH_AREA" not in grouped.columns:
+        raise ValueError("전용면적 그룹 생성에 ARCH_AREA 컬럼이 필요합니다.")
+
+    exact = pd.to_numeric(grouped["ARCH_AREA"], errors="coerce")
+    grouped["AREA_EXACT"] = exact
+    valid = exact.notna() & np.isfinite(exact) & exact.gt(0)
+    nominal = pd.Series(pd.NA, index=grouped.index, dtype="Int64")
+    nominal.loc[valid] = np.floor(
+        exact.loc[valid] / AREA_GROUP_WIDTH_SQM
+    ).astype("int64")
+    grouped["AREA_GROUP"] = nominal.astype("string") + "㎡형"
+    grouped.loc[~valid, "AREA_GROUP"] = pd.NA
+    return grouped
 
 
 def build_effective_transactions(

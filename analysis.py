@@ -51,6 +51,70 @@ def filter_complex_transactions(df: pd.DataFrame, config: pd.Series) -> pd.DataF
     return df.loc[mask].copy()
 
 
+def filter_area_group(
+    transactions: pd.DataFrame,
+    area_group: str | None,
+) -> pd.DataFrame:
+    """Return one analysis area group, or all rows when no group is selected."""
+    if area_group in {None, "전체"}:
+        return transactions.copy()
+    if "AREA_GROUP" not in transactions.columns:
+        raise ValueError("면적 그룹 필터에 AREA_GROUP 컬럼이 필요합니다.")
+    return transactions.loc[transactions["AREA_GROUP"].eq(area_group)].copy()
+
+
+def build_area_group_summary(transactions: pd.DataFrame) -> pd.DataFrame:
+    """Summarize effective transactions by reusable AREA_GROUP."""
+    columns = [
+        "AREA_GROUP",
+        "AREA_MIN",
+        "AREA_MAX",
+        "AREA_VALUES",
+        "TRANSACTION_COUNT",
+        "LATEST_CONTRACT_DATE",
+        "LATEST_PRICE",
+        "AVERAGE_PRICE",
+        "MEDIAN_PRICE",
+        "HIGHEST_PRICE",
+        "LOWEST_PRICE",
+    ]
+    if transactions.empty:
+        return pd.DataFrame(columns=columns)
+    required = {"AREA_GROUP", "AREA_EXACT", "CTRT_DAY", "THING_AMT"}
+    missing = sorted(required.difference(transactions.columns))
+    if missing:
+        raise ValueError(f"면적 그룹 요약 컬럼이 없습니다: {', '.join(missing)}")
+
+    rows = []
+    grouped = transactions.dropna(subset=["AREA_GROUP"]).groupby(
+        "AREA_GROUP", sort=False
+    )
+    for area_group, group in grouped:
+        ordered = group.sort_values("CTRT_DAY", kind="stable")
+        latest = ordered.iloc[-1]
+        area_values = tuple(
+            sorted(float(value) for value in group["AREA_EXACT"].unique())
+        )
+        rows.append(
+            {
+                "AREA_GROUP": area_group,
+                "AREA_MIN": float(group["AREA_EXACT"].min()),
+                "AREA_MAX": float(group["AREA_EXACT"].max()),
+                "AREA_VALUES": area_values,
+                "TRANSACTION_COUNT": int(len(group)),
+                "LATEST_CONTRACT_DATE": latest["CTRT_DAY"],
+                "LATEST_PRICE": float(latest["THING_AMT"]),
+                "AVERAGE_PRICE": float(group["THING_AMT"].mean()),
+                "MEDIAN_PRICE": float(group["THING_AMT"].median()),
+                "HIGHEST_PRICE": float(group["THING_AMT"].max()),
+                "LOWEST_PRICE": float(group["THING_AMT"].min()),
+            }
+        )
+    return pd.DataFrame(rows, columns=columns).sort_values(
+        ["AREA_MIN", "AREA_MAX"], kind="stable", ignore_index=True
+    )
+
+
 def build_watchlist_transactions(
     df: pd.DataFrame,
     watchlist: pd.DataFrame,

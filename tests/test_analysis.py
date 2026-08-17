@@ -3,11 +3,14 @@ import unittest
 import pandas as pd
 
 from analysis import (
+    build_area_group_summary,
     build_monthly_trend,
     build_watchlist_summary,
+    filter_area_group,
     filter_complex_transactions,
     select_reference_price,
 )
+from data_pipeline import assign_area_group
 
 
 def transactions(name, amounts_and_dates):
@@ -27,6 +30,56 @@ def transactions(name, amounts_and_dates):
 
 
 class AnalysisTests(unittest.TestCase):
+    def test_area_group_summary_preserves_rare_groups_and_total_count(self):
+        data = pd.DataFrame(
+            {
+                "CTRT_DAY": pd.to_datetime(
+                    ["2026-01-01", "2026-02-01", "2026-03-01", "2026-04-01"]
+                ),
+                "THING_AMT": [8.0, 8.5, 12.0, 20.0],
+                "ARCH_AREA": [59.21, 59.79, 84.95, 114.705],
+            }
+        )
+        grouped = assign_area_group(data)
+
+        summary = build_area_group_summary(grouped)
+
+        self.assertEqual(
+            summary["AREA_GROUP"].tolist(), ["59㎡형", "84㎡형", "114㎡형"]
+        )
+        self.assertEqual(summary["TRANSACTION_COUNT"].tolist(), [2, 1, 1])
+        self.assertEqual(summary["TRANSACTION_COUNT"].sum(), len(grouped))
+        self.assertEqual(summary.iloc[-1]["LATEST_PRICE"], 20.0)
+
+    def test_area_group_filter_separates_distinct_types_and_supports_all(self):
+        data = assign_area_group(
+            pd.DataFrame(
+                {
+                    "ARCH_AREA": [59.21, 59.79, 84.95],
+                    "THING_AMT": [8.0, 8.5, 12.0],
+                }
+            )
+        )
+
+        selected = filter_area_group(data, "59㎡형")
+
+        self.assertEqual(len(selected), 2)
+        self.assertTrue(selected["ARCH_AREA"].lt(60).all())
+        self.assertEqual(len(filter_area_group(data, "전체")), 3)
+
+    def test_area_columns_do_not_change_existing_complex_summary(self):
+        base = transactions(
+            "기준",
+            [("2026-05-10", 6.0), ("2026-06-10", 8.0)],
+        )
+
+        before = select_reference_price(base, pd.Timestamp("2026-06-30"))
+        after = select_reference_price(
+            assign_area_group(base), pd.Timestamp("2026-06-30")
+        )
+
+        self.assertEqual(before, after)
+
     def test_monthly_trend_uses_contract_year_month_and_keeps_alias(self):
         data = transactions(
             "A",

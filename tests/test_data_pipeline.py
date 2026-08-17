@@ -6,6 +6,7 @@ import pandas as pd
 from data_pipeline import (
     DEFAULT_ANALYSIS_START_DATE,
     SERVICE_NAME,
+    assign_area_group,
     build_effective_transactions,
     build_data_status,
     combine_raw_data,
@@ -88,6 +89,47 @@ class DataPipelineTests(unittest.TestCase):
         self.assertEqual(default_view.iloc[0]["CTRT_DAY"], pd.Timestamp("2025-01-01"))
         self.assertEqual(len(expanded_view), 2)
         self.assertTrue(expanded_view["RCPT_YR"].eq(2026).all())
+
+    def test_area_group_uses_nominal_interval_and_preserves_exact_area(self):
+        source = pd.DataFrame(
+            {"ARCH_AREA": [59.21, 59.58, 59.79, 84.706, 84.95, 114.705]}
+        )
+        original = source["ARCH_AREA"].copy()
+
+        grouped = assign_area_group(source)
+
+        self.assertTrue(grouped["ARCH_AREA"].equals(original))
+        self.assertTrue(grouped["AREA_EXACT"].equals(original))
+        self.assertEqual(
+            grouped["AREA_GROUP"].tolist(),
+            ["59㎡형", "59㎡형", "59㎡형", "84㎡형", "84㎡형", "114㎡형"],
+        )
+
+    def test_area_group_is_applied_after_cancelled_transactions_are_removed(self):
+        active = {
+            "RCPT_YR": 2026,
+            "BLDG_NM": "테스트아파트",
+            "CTRT_DAY": pd.Timestamp("2026-01-15"),
+            "THING_AMT": 10.0,
+            "ARCH_AREA": 59.79,
+            "FLR": 10,
+            "RTRCN_DAY": pd.NA,
+        }
+        cancelled = {
+            **active,
+            "CTRT_DAY": pd.Timestamp("2026-02-15"),
+            "ARCH_AREA": 84.95,
+            "RTRCN_DAY": 20260301,
+        }
+
+        effective, _ = build_effective_transactions(
+            pd.DataFrame([active, cancelled])
+        )
+        grouped = assign_area_group(effective)
+
+        self.assertEqual(len(grouped), 1)
+        self.assertEqual(grouped.iloc[0]["AREA_GROUP"], "59㎡형")
+        self.assertNotIn("84㎡형", grouped["AREA_GROUP"].tolist())
 
     def test_single_snapshot_preserves_repeated_rows_and_cancellation(self):
         base = {
