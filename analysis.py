@@ -605,6 +605,79 @@ def build_monthly_gap_trend(
     return result
 
 
+def build_multi_candidate_gap_comparison(
+    base_transactions: pd.DataFrame,
+    candidate_specs: list[dict],
+    *,
+    reference_name: str,
+    reference_area_group: str,
+    analysis_as_of_date: str | pd.Timestamp,
+    data_available_from: str | pd.Timestamp,
+) -> pd.DataFrame:
+    """Apply the canonical 1:1 GAP calculation to multiple candidate scopes."""
+    rows = []
+    for order, spec in enumerate(candidate_specs):
+        candidate_transactions = spec["transactions"]
+        comparison = build_trade_up_gap_comparison(
+            base_transactions,
+            candidate_transactions,
+            analysis_as_of_date=analysis_as_of_date,
+            data_available_from=data_available_from,
+        )
+        base_metrics = comparison["base"]["price_metrics"]
+        candidate_metrics = comparison["candidate"]["price_metrics"]
+        gap_3m = comparison["3M"]
+        gap_6m = comparison["6M"]
+        rows.append(
+            {
+                "WATCHLIST_ORDER": spec.get("watchlist_order", order),
+                "REFERENCE_COMPLEX": reference_name,
+                "REFERENCE_AREA_GROUP": reference_area_group,
+                "CANDIDATE_COMPLEX": spec["name"],
+                "CANDIDATE_AREA_GROUP": spec["area_group"],
+                "ANALYSIS_AS_OF_DATE": comparison["analysis_as_of_date"],
+                "REFERENCE_3M_MEDIAN": base_metrics["3M"]["current"]["median_price"],
+                "REFERENCE_PREVIOUS_3M_MEDIAN": base_metrics["3M"]["previous"]["median_price"],
+                "REFERENCE_3M_COUNT": base_metrics["3M"]["current"]["transaction_count"],
+                "REFERENCE_3M_SAMPLE_STATUS": base_metrics["3M"]["current"]["sample_status"],
+                "CURRENT_3M_GAP": gap_3m["current_gap"],
+                "PREVIOUS_3M_GAP": gap_3m["previous_gap"],
+                "GAP_CHANGE_3M": gap_3m["gap_change"],
+                "GAP_CHANGE_PCT_3M": gap_3m["gap_change_pct"],
+                "GAP_STATUS_3M": (
+                    "비교불가"
+                    if gap_3m["gap_change_status"] == "N/A"
+                    else gap_3m["gap_change_status"]
+                ),
+                "CURRENT_6M_GAP": gap_6m["current_gap"],
+                "PREVIOUS_6M_GAP": gap_6m["previous_gap"],
+                "GAP_CHANGE_6M": gap_6m["gap_change"],
+                "GAP_CHANGE_PCT_6M": gap_6m["gap_change_pct"],
+                "GAP_STATUS_6M": (
+                    "비교불가"
+                    if gap_6m["gap_change_status"] == "N/A"
+                    else gap_6m["gap_change_status"]
+                ),
+                "CANDIDATE_3M_MEDIAN": candidate_metrics["3M"]["current"]["median_price"],
+                "CANDIDATE_PREVIOUS_3M_MEDIAN": candidate_metrics["3M"]["previous"]["median_price"],
+                "CANDIDATE_3M_COUNT": candidate_metrics["3M"]["current"]["transaction_count"],
+                "CANDIDATE_3M_SAMPLE_STATUS": candidate_metrics["3M"]["current"]["sample_status"],
+                "CANDIDATE_3M_PRICE_CHANGE_PCT": candidate_metrics["3M"]["price_change_pct"],
+                "CANDIDATE_6M_PRICE_CHANGE_PCT": candidate_metrics["6M"]["price_change_pct"],
+                "CANDIDATE_RECENT_TRADE_DATE": comparison["candidate"]["latest_contract_date"],
+                "CANDIDATE_RECENT_PRICE": comparison["candidate"]["latest_price"],
+                "CANDIDATE_RECENT_TRADE_AGE": comparison["candidate"]["recent_trade_age_days"],
+                "CANDIDATE_RECENT_TRADE_STATUS": comparison["candidate"]["recent_trade_status"],
+                "CANDIDATE_12M_MEDIAN": candidate_metrics["12M"]["current"]["median_price"],
+                "CANDIDATE_12M_HIGH": candidate_metrics["12M"]["current"]["highest_price"],
+                "CANDIDATE_12M_LOW": candidate_metrics["12M"]["current"]["lowest_price"],
+                "CANDIDATE_HIGH_GAP_AMOUNT": candidate_metrics["12M"]["high_gap_amount"],
+                "CANDIDATE_HIGH_GAP_PCT": candidate_metrics["12M"]["high_gap_pct"],
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def build_watchlist_transactions(
     df: pd.DataFrame,
     watchlist: pd.DataFrame,

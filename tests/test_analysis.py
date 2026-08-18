@@ -7,6 +7,7 @@ from analysis import (
     build_monthly_trend,
     build_monthly_price_volume_trend,
     build_monthly_gap_trend,
+    build_multi_candidate_gap_comparison,
     build_price_change_metrics,
     build_trade_up_gap_comparison,
     build_watchlist_area_comparison,
@@ -50,6 +51,56 @@ def price_scope(amounts_and_dates, *, complex_id="complex-1", area_group="84㎡�
 
 
 class AnalysisTests(unittest.TestCase):
+    def test_multi_candidate_gap_reuses_one_to_one_results(self):
+        base = price_scope(
+            [("2026-03-01", 7.0), ("2026-07-01", 8.0)],
+            complex_id="base",
+            area_group="59㎡형",
+        )
+        first = price_scope(
+            [("2026-03-01", 13.0), ("2026-07-01", 13.5)],
+            complex_id="first",
+        )
+        second = price_scope(
+            [("2026-07-01", 20.0)], complex_id="second"
+        )
+        specs = [
+            {
+                "name": "첫 후보",
+                "area_group": "84㎡형",
+                "watchlist_order": 2,
+                "transactions": first,
+            },
+            {
+                "name": "둘째 후보",
+                "area_group": "84㎡형",
+                "watchlist_order": 3,
+                "transactions": second,
+            },
+        ]
+
+        result = build_multi_candidate_gap_comparison(
+            base,
+            specs,
+            reference_name="기준",
+            reference_area_group="59㎡형",
+            analysis_as_of_date="2026-08-14",
+            data_available_from="2025-01-01",
+        )
+        direct = build_trade_up_gap_comparison(
+            base,
+            first,
+            analysis_as_of_date="2026-08-14",
+            data_available_from="2025-01-01",
+        )
+
+        self.assertEqual(result["CANDIDATE_COMPLEX"].tolist(), ["첫 후보", "둘째 후보"])
+        self.assertEqual(result.iloc[0]["CURRENT_3M_GAP"], direct["3M"]["current_gap"])
+        self.assertEqual(result.iloc[0]["GAP_CHANGE_6M"], direct["6M"]["gap_change"])
+        self.assertEqual(result.iloc[0]["CANDIDATE_3M_COUNT"], 1)
+        self.assertEqual(result.iloc[0]["CANDIDATE_3M_SAMPLE_STATUS"], "표본 적음")
+        self.assertEqual(result.iloc[1]["GAP_STATUS_3M"], "비교불가")
+
     def test_trade_up_gap_uses_matching_current_and_previous_periods(self):
         base = price_scope(
             [("2026-03-01", 7.0), ("2026-07-01", 8.0)],

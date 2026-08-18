@@ -16,6 +16,7 @@ from analysis import (
     build_monthly_trend,
     build_monthly_price_volume_trend,
     build_monthly_gap_trend,
+    build_multi_candidate_gap_comparison,
     build_price_change_metrics,
     build_trade_up_gap_comparison,
     build_watchlist_area_comparison,
@@ -520,6 +521,7 @@ tabs = st.tabs(
         "🔁 관심단지 비교",
         "📋 Watchlist 전체 비교",
         "↔️ 1:1 갈아타기 GAP",
+        "🧭 다중 후보 GAP",
     ]
 )
 
@@ -1198,6 +1200,223 @@ with tabs[4]:
             title="후보 월 중앙값 - 기준 월 중앙값",
         )
         st.plotly_chart(gap_figure, width="stretch")
+
+
+with tabs[5]:
+    st.header("기준 주택 1개 vs 여러 후보 GAP 비교")
+    st.caption(
+        f"공통 분석 기준일 {analysis_as_of_date:%Y-%m-%d} · 후보별 평형은 이번 화면에서만 "
+        "선택하며 자동 추천이나 순위를 제공하지 않습니다."
+    )
+
+    reference_columns = st.columns(2)
+    with reference_columns[0]:
+        multi_base_name = st.selectbox(
+            "기준 단지",
+            watchlist["display_name"].tolist(),
+            index=0,
+            key="multi_gap_base_complex",
+        )
+        multi_base_config = watchlist[
+            watchlist["display_name"].eq(multi_base_name)
+        ].iloc[0]
+        multi_base_complex = filter_complex_transactions(df, multi_base_config)
+    with reference_columns[1]:
+        multi_base_area_options = build_area_group_summary(multi_base_complex)[
+            "AREA_GROUP"
+        ].tolist()
+        multi_base_area_index = (
+            multi_base_area_options.index("59㎡형")
+            if "59㎡형" in multi_base_area_options
+            else 0
+        )
+        multi_base_area = st.selectbox(
+            "기준 평형",
+            multi_base_area_options,
+            index=multi_base_area_index,
+            key="multi_gap_base_area",
+        )
+    multi_base_scope = filter_area_group(multi_base_complex, multi_base_area)
+    multi_base_metrics = build_price_change_metrics(
+        multi_base_scope,
+        analysis_as_of_date=analysis_as_of_date,
+        data_available_from=data_available_from,
+    )
+    base_3m = multi_base_metrics["3M"]
+    base_latest_age = int(
+        (analysis_as_of_date - multi_base_metrics["latest_contract_date"]).days
+    )
+    st.markdown(f"### 기준: {multi_base_name} / {multi_base_area}")
+    base_summary_columns = st.columns(5)
+    base_summary_columns[0].metric(
+        "최근 3M 중앙값",
+        format_optional_money(base_3m["current"]["median_price"]),
+    )
+    base_summary_columns[1].metric(
+        "직전 3M 중앙값",
+        format_optional_money(base_3m["previous"]["median_price"]),
+    )
+    base_summary_columns[2].metric(
+        "최근 3M 가격 변화",
+        format_optional_pct(base_3m["price_change_pct"]),
+    )
+    base_summary_columns[3].metric(
+        "최근 3M 거래",
+        f"{base_3m['current']['transaction_count']}건 · {base_3m['current']['sample_status']}",
+    )
+    base_summary_columns[4].metric(
+        "최근 거래",
+        f"{format_date(multi_base_metrics['latest_contract_date'])}",
+        delta=f"{base_latest_age}일 전",
+        delta_color="off",
+    )
+
+    candidate_names = [
+        name
+        for name in watchlist["display_name"].tolist()
+        if name != multi_base_name
+    ]
+    selected_candidate_names = st.multiselect(
+        "비교 후보",
+        candidate_names,
+        default=candidate_names,
+        key="multi_gap_candidates",
+    )
+    candidate_specs = []
+    if selected_candidate_names:
+        st.markdown("#### 후보별 비교 평형")
+        area_columns = st.columns(3)
+        for position, candidate_name in enumerate(selected_candidate_names):
+            candidate_config = watchlist[
+                watchlist["display_name"].eq(candidate_name)
+            ].iloc[0]
+            candidate_complex = filter_complex_transactions(df, candidate_config)
+            area_options = build_area_group_summary(candidate_complex)[
+                "AREA_GROUP"
+            ].tolist()
+            preferred_area = (
+                "112㎡형"
+                if candidate_name == "한진해모로" and "112㎡형" in area_options
+                else "84㎡형" if "84㎡형" in area_options else area_options[0]
+            )
+            with area_columns[position % len(area_columns)]:
+                candidate_area = st.selectbox(
+                    candidate_name,
+                    area_options,
+                    index=area_options.index(preferred_area),
+                    key=f"multi_gap_area_{candidate_name}",
+                )
+            candidate_specs.append(
+                {
+                    "name": candidate_name,
+                    "area_group": candidate_area,
+                    "watchlist_order": int(
+                        watchlist.index[
+                            watchlist["display_name"].eq(candidate_name)
+                        ][0]
+                    ),
+                    "transactions": filter_area_group(
+                        candidate_complex, candidate_area
+                    ),
+                }
+            )
+
+    if not candidate_specs:
+        st.info("비교할 후보 단지를 한 곳 이상 선택하세요.")
+    else:
+        multi_comparison = build_multi_candidate_gap_comparison(
+            multi_base_scope,
+            candidate_specs,
+            reference_name=multi_base_name,
+            reference_area_group=multi_base_area,
+            analysis_as_of_date=analysis_as_of_date,
+            data_available_from=data_available_from,
+        )
+        control_columns = st.columns([2, 1, 1])
+        multi_sort_options = {
+            "등록 순서": "WATCHLIST_ORDER",
+            "현재 3M GAP": "CURRENT_3M_GAP",
+            "3M GAP 변화금액": "GAP_CHANGE_3M",
+            "3M GAP 변화율": "GAP_CHANGE_PCT_3M",
+            "현재 6M GAP": "CURRENT_6M_GAP",
+            "6M GAP 변화금액": "GAP_CHANGE_6M",
+            "최근 3M 가격 변화율": "CANDIDATE_3M_PRICE_CHANGE_PCT",
+            "최근 3M 거래건수": "CANDIDATE_3M_COUNT",
+            "최근 거래일": "CANDIDATE_RECENT_TRADE_DATE",
+            "고점 대비 수준": "CANDIDATE_HIGH_GAP_PCT",
+        }
+        multi_sort_label = control_columns[0].selectbox(
+            "정렬 기준",
+            list(multi_sort_options),
+            key="multi_gap_sort",
+        )
+        multi_descending = control_columns[1].toggle(
+            "내림차순",
+            value=multi_sort_label != "등록 순서",
+            key="multi_gap_descending",
+        )
+        status_filter = control_columns[2].selectbox(
+            "3M GAP 상태",
+            ["전체", "축소", "확대", "변화 없음", "비교불가"],
+            key="multi_gap_status_filter",
+        )
+        filtered_multi = multi_comparison.copy()
+        if status_filter != "전체":
+            filtered_multi = filtered_multi[
+                filtered_multi["GAP_STATUS_3M"].eq(status_filter)
+            ]
+        filtered_multi = filtered_multi.sort_values(
+            multi_sort_options[multi_sort_label],
+            ascending=not multi_descending,
+            na_position="last",
+            kind="stable",
+        )
+        core_columns = [
+            "CANDIDATE_COMPLEX",
+            "CANDIDATE_AREA_GROUP",
+            "CURRENT_3M_GAP",
+            "PREVIOUS_3M_GAP",
+            "GAP_CHANGE_3M",
+            "GAP_CHANGE_PCT_3M",
+            "GAP_STATUS_3M",
+            "CURRENT_6M_GAP",
+            "GAP_CHANGE_6M",
+            "CANDIDATE_3M_MEDIAN",
+            "CANDIDATE_3M_COUNT",
+            "CANDIDATE_3M_SAMPLE_STATUS",
+            "CANDIDATE_RECENT_TRADE_DATE",
+            "CANDIDATE_RECENT_TRADE_AGE",
+            "CANDIDATE_RECENT_TRADE_STATUS",
+        ]
+        st.markdown("#### 후보 전체 비교표")
+        st.dataframe(
+            filtered_multi[core_columns],
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "CANDIDATE_COMPLEX": "후보 단지",
+                "CANDIDATE_AREA_GROUP": "평형",
+                "CURRENT_3M_GAP": st.column_config.NumberColumn("현재 3M GAP", format="%.2f억"),
+                "PREVIOUS_3M_GAP": st.column_config.NumberColumn("직전 3M GAP", format="%.2f억"),
+                "GAP_CHANGE_3M": st.column_config.NumberColumn("3M GAP 변화", format="%+.2f억"),
+                "GAP_CHANGE_PCT_3M": st.column_config.NumberColumn("3M GAP 변화율", format="%+.1f%%"),
+                "GAP_STATUS_3M": "상태",
+                "CURRENT_6M_GAP": st.column_config.NumberColumn("현재 6M GAP", format="%.2f억"),
+                "GAP_CHANGE_6M": st.column_config.NumberColumn("6M GAP 변화", format="%+.2f억"),
+                "CANDIDATE_3M_MEDIAN": st.column_config.NumberColumn("후보 3M 중앙값", format="%.2f억"),
+                "CANDIDATE_3M_COUNT": "후보 3M 거래",
+                "CANDIDATE_3M_SAMPLE_STATUS": "표본 상태",
+                "CANDIDATE_RECENT_TRADE_DATE": st.column_config.DateColumn("최근 거래일", format="YYYY-MM-DD"),
+                "CANDIDATE_RECENT_TRADE_AGE": "경과일",
+                "CANDIDATE_RECENT_TRADE_STATUS": "최신성",
+            },
+        )
+        with st.expander("후보 가격·거래량 상세 지표"):
+            st.dataframe(
+                filtered_multi,
+                width="stretch",
+                hide_index=True,
+            )
 
 st.sidebar.markdown("---")
 st.sidebar.info(
