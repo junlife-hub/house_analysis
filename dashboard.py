@@ -15,7 +15,9 @@ from analysis import (
     build_area_group_summary,
     build_monthly_trend,
     build_monthly_price_volume_trend,
+    build_monthly_gap_trend,
     build_price_change_metrics,
+    build_trade_up_gap_comparison,
     build_watchlist_area_comparison,
     build_watchlist_summary,
     determine_analysis_as_of_date,
@@ -225,6 +227,19 @@ def format_optional_pct(value: object) -> str:
     if value is None or pd.isna(value):
         return "-"
     return f"{float(value):+.1f}%"
+
+
+def format_gap_money(value: object, *, signed: bool = False) -> str:
+    """Use an explicit N/A for GAP values that cannot be calculated."""
+    if value is None or pd.isna(value):
+        return "N/A"
+    return format_optional_money(value, signed=signed)
+
+
+def format_gap_pct(value: object) -> str:
+    if value is None or pd.isna(value):
+        return "N/A"
+    return format_optional_pct(value)
 
 
 def render_period_change_metrics(label: str, period: dict) -> None:
@@ -504,6 +519,7 @@ tabs = st.tabs(
         "🏠 태강아파트 (공릉동)",
         "🔁 관심단지 비교",
         "📋 Watchlist 전체 비교",
+        "↔️ 1:1 갈아타기 GAP",
     ]
 )
 
@@ -1001,6 +1017,187 @@ with tabs[3]:
             f"{selected_comparison_area}이 없는 {missing_count}개 단지는 다른 면적으로 "
             "대체하지 않고 '해당 평형 없음'으로 표시했습니다."
         )
+
+
+with tabs[4]:
+    st.header("기준 주택 vs 후보 주택 1:1 갈아타기 GAP")
+    st.caption(
+        f"공통 분석 기준일 {analysis_as_of_date:%Y-%m-%d} · 대표가격은 거래금액 중앙값 · "
+        "GAP은 후보 가격에서 기준 가격을 뺀 값입니다."
+    )
+
+    selector_columns = st.columns(2)
+    with selector_columns[0]:
+        st.markdown("#### 기준 주택")
+        base_name = st.selectbox(
+            "기준 단지",
+            watchlist["display_name"].tolist(),
+            index=0,
+            key="trade_up_base_complex",
+        )
+        base_config = watchlist[watchlist["display_name"].eq(base_name)].iloc[0]
+        base_complex = filter_complex_transactions(df, base_config)
+        base_area_options = build_area_group_summary(base_complex)["AREA_GROUP"].tolist()
+        base_area_index = base_area_options.index("59㎡형") if "59㎡형" in base_area_options else 0
+        base_area = st.selectbox(
+            "기준 평형",
+            base_area_options,
+            index=base_area_index,
+            key="trade_up_base_area",
+        )
+    with selector_columns[1]:
+        st.markdown("#### 후보 주택")
+        candidate_default = (
+            watchlist["display_name"].tolist().index("연희대우")
+            if "연희대우" in watchlist["display_name"].tolist()
+            else min(1, len(watchlist) - 1)
+        )
+        candidate_name = st.selectbox(
+            "후보 단지",
+            watchlist["display_name"].tolist(),
+            index=candidate_default,
+            key="trade_up_candidate_complex",
+        )
+        candidate_config = watchlist[
+            watchlist["display_name"].eq(candidate_name)
+        ].iloc[0]
+        candidate_complex = filter_complex_transactions(df, candidate_config)
+        candidate_area_options = build_area_group_summary(candidate_complex)[
+            "AREA_GROUP"
+        ].tolist()
+        candidate_area_index = (
+            candidate_area_options.index("84㎡형")
+            if "84㎡형" in candidate_area_options
+            else 0
+        )
+        candidate_area = st.selectbox(
+            "후보 평형",
+            candidate_area_options,
+            index=candidate_area_index,
+            key="trade_up_candidate_area",
+        )
+
+    base_scope = filter_area_group(base_complex, base_area)
+    candidate_scope = filter_area_group(candidate_complex, candidate_area)
+    gap_result = build_trade_up_gap_comparison(
+        base_scope,
+        candidate_scope,
+        analysis_as_of_date=analysis_as_of_date,
+        data_available_from=data_available_from,
+    )
+    base_metrics = gap_result["base"]["price_metrics"]
+    candidate_metrics = gap_result["candidate"]["price_metrics"]
+
+    st.markdown(f"### {base_name} {base_area} → {candidate_name} {candidate_area}")
+    latest_rows = []
+    for label, name, area, home in [
+        ("기준", base_name, base_area, gap_result["base"]),
+        ("후보", candidate_name, candidate_area, gap_result["candidate"]),
+    ]:
+        latest_rows.append(
+            {
+                "구분": label,
+                "단지": name,
+                "평형": area,
+                "최근 거래일": home["latest_contract_date"],
+                "최근 실거래가(억)": home["latest_price"],
+                "경과일": home["recent_trade_age_days"],
+                "최근 거래 상태": home["recent_trade_status"],
+            }
+        )
+    st.dataframe(
+        pd.DataFrame(latest_rows).style.format(
+            {"최근 거래일": lambda value: format_date(value), "최근 실거래가(억)": "{:.2f}"},
+            na_rep="-",
+        ),
+        width="stretch",
+        hide_index=True,
+    )
+
+    for months in (3, 6):
+        gap = gap_result[f"{months}M"]
+        base_period = base_metrics[f"{months}M"]
+        candidate_period = candidate_metrics[f"{months}M"]
+        st.markdown(f"#### {months}개월 GAP 변화")
+        gap_columns = st.columns(5)
+        gap_columns[0].metric(
+            "현재 GAP", format_gap_money(gap["current_gap"], signed=True)
+        )
+        gap_columns[1].metric(
+            "직전 GAP", format_gap_money(gap["previous_gap"], signed=True)
+        )
+        gap_columns[2].metric(
+            "GAP 변화", format_gap_money(gap["gap_change"], signed=True)
+        )
+        gap_columns[3].metric("GAP 변화율", format_gap_pct(gap["gap_change_pct"]))
+        gap_columns[4].metric("변화 방향", gap["gap_change_status"])
+        st.caption(
+            f"기준 최근 {base_period['current']['transaction_count']}건 · "
+            f"{base_period['current']['sample_status']} / "
+            f"후보 최근 {candidate_period['current']['transaction_count']}건 · "
+            f"{candidate_period['current']['sample_status']}"
+        )
+        if (
+            base_period["current"]["sample_status"] != "일반"
+            or candidate_period["current"]["sample_status"] != "일반"
+        ):
+            st.warning(
+                f"{months}개월 GAP에 거래 없음 또는 표본 적음 구간이 있습니다. "
+                "GAP 숫자와 표본 상태를 함께 확인하세요."
+            )
+
+    detail_rows = []
+    for label, period_key, section, gap_key, price_key in [
+        ("최근 3M 중앙값", "3M", "current", "current_gap", "median_price"),
+        ("직전 3M 중앙값", "3M", "previous", "previous_gap", "median_price"),
+        ("최근 6M 중앙값", "6M", "current", "current_gap", "median_price"),
+        ("직전 6M 중앙값", "6M", "previous", "previous_gap", "median_price"),
+        ("최근 12M 중앙값", "12M", "current", "current_gap", "median_price"),
+        ("최근 12M 최고가", "12M", "current", "highest_price_gap", "highest_price"),
+        ("최근 12M 최저가", "12M", "current", "lowest_price_gap", "lowest_price"),
+    ]:
+        base_price = base_metrics[period_key][section][price_key]
+        candidate_price = candidate_metrics[period_key][section][price_key]
+        detail_rows.append(
+            {
+                "구분": label,
+                "기준 가격(억)": base_price,
+                "후보 가격(억)": candidate_price,
+                "가격 GAP(억)": gap_result[period_key][gap_key],
+            }
+        )
+    st.markdown("#### 가격 비교 상세")
+    st.dataframe(
+        pd.DataFrame(detail_rows).style.format(
+            {"기준 가격(억)": "{:.2f}", "후보 가격(억)": "{:.2f}", "가격 GAP(억)": "{:+.2f}"},
+            na_rep="N/A",
+        ),
+        width="stretch",
+        hide_index=True,
+    )
+
+    trend_start = (analysis_as_of_date.to_period("M") - 11).start_time.normalize()
+    monthly_gap = build_monthly_gap_trend(
+        base_scope,
+        candidate_scope,
+        start_date=trend_start,
+        end_date=analysis_as_of_date,
+    )
+    observed_gap = monthly_gap.dropna(subset=["MONTHLY_GAP"])
+    st.markdown("#### 월별 GAP 추세")
+    st.caption("양쪽 단지에 같은 계약월의 중앙값이 모두 있을 때만 GAP을 표시합니다.")
+    if observed_gap.empty:
+        st.info("같은 달에 양쪽 거래가 모두 존재한 월이 없습니다.")
+    else:
+        gap_figure = px.line(
+            observed_gap,
+            x="CONTRACT_YEAR_MONTH",
+            y="MONTHLY_GAP",
+            markers=True,
+            labels={"CONTRACT_YEAR_MONTH": "계약연월", "MONTHLY_GAP": "월별 GAP(억)"},
+            title="후보 월 중앙값 - 기준 월 중앙값",
+        )
+        st.plotly_chart(gap_figure, width="stretch")
 
 st.sidebar.markdown("---")
 st.sidebar.info(

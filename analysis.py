@@ -458,6 +458,153 @@ def build_watchlist_area_comparison(
     )
 
 
+def _gap_value(candidate_price: float | None, base_price: float | None) -> float | None:
+    if candidate_price is None or base_price is None:
+        return None
+    return candidate_price - base_price
+
+
+def gap_change_status(gap_change: float | None) -> str:
+    """Describe only the direction of a GAP change without a recommendation."""
+    if gap_change is None:
+        return "N/A"
+    if abs(gap_change) < 1e-12:
+        return "변화 없음"
+    return "축소" if gap_change < 0 else "확대"
+
+
+def build_gap_change_metrics(base_period: dict, candidate_period: dict) -> dict:
+    """Combine two matching period metrics into current/previous GAP metrics."""
+    current_gap = _gap_value(
+        candidate_period["current"]["median_price"],
+        base_period["current"]["median_price"],
+    )
+    previous_gap = _gap_value(
+        candidate_period["previous"]["median_price"],
+        base_period["previous"]["median_price"],
+    )
+    gap_change = (
+        current_gap - previous_gap
+        if current_gap is not None and previous_gap is not None
+        else None
+    )
+    gap_change_pct = (
+        gap_change / abs(previous_gap) * 100
+        if gap_change is not None and previous_gap not in {None, 0}
+        else None
+    )
+    return {
+        "current_gap": current_gap,
+        "previous_gap": previous_gap,
+        "gap_change": gap_change,
+        "gap_change_pct": gap_change_pct,
+        "gap_change_status": gap_change_status(gap_change),
+    }
+
+
+def _trade_up_home_summary(metrics: dict, as_of: pd.Timestamp) -> dict:
+    latest_date = metrics["latest_contract_date"]
+    age_days = int((as_of - latest_date).days) if latest_date is not None else None
+    return {
+        "latest_contract_date": latest_date,
+        "latest_price": metrics["latest_price"],
+        "recent_trade_age_days": age_days,
+        "recent_trade_status": recent_trade_status(age_days),
+        "price_metrics": metrics,
+    }
+
+
+def build_trade_up_gap_comparison(
+    base_transactions: pd.DataFrame,
+    candidate_transactions: pd.DataFrame,
+    *,
+    analysis_as_of_date: str | pd.Timestamp,
+    data_available_from: str | pd.Timestamp,
+) -> dict:
+    """Compare one base and one candidate COMPLEX_ID × AREA_GROUP scope."""
+    if base_transactions.empty or candidate_transactions.empty:
+        raise ValueError("1:1 GAP 비교에는 기준과 후보 거래가 모두 필요합니다.")
+    as_of = pd.Timestamp(analysis_as_of_date).normalize()
+    base_metrics = build_price_change_metrics(
+        base_transactions,
+        analysis_as_of_date=as_of,
+        data_available_from=data_available_from,
+    )
+    candidate_metrics = build_price_change_metrics(
+        candidate_transactions,
+        analysis_as_of_date=as_of,
+        data_available_from=data_available_from,
+    )
+    return {
+        "analysis_as_of_date": as_of,
+        "base": _trade_up_home_summary(base_metrics, as_of),
+        "candidate": _trade_up_home_summary(candidate_metrics, as_of),
+        "3M": build_gap_change_metrics(base_metrics["3M"], candidate_metrics["3M"]),
+        "6M": build_gap_change_metrics(base_metrics["6M"], candidate_metrics["6M"]),
+        "12M": {
+            "current_gap": _gap_value(
+                candidate_metrics["12M"]["current"]["median_price"],
+                base_metrics["12M"]["current"]["median_price"],
+            ),
+            "highest_price_gap": _gap_value(
+                candidate_metrics["12M"]["current"]["highest_price"],
+                base_metrics["12M"]["current"]["highest_price"],
+            ),
+            "lowest_price_gap": _gap_value(
+                candidate_metrics["12M"]["current"]["lowest_price"],
+                base_metrics["12M"]["current"]["lowest_price"],
+            ),
+        },
+    }
+
+
+def build_monthly_gap_trend(
+    base_transactions: pd.DataFrame,
+    candidate_transactions: pd.DataFrame,
+    *,
+    start_date: str | pd.Timestamp,
+    end_date: str | pd.Timestamp,
+) -> pd.DataFrame:
+    """Return a monthly GAP only where both homes have an observed median price."""
+    base = build_monthly_price_volume_trend(
+        base_transactions, start_date=start_date, end_date=end_date
+    ).rename(
+        columns={
+            "MEDIAN_PRICE": "BASE_MEDIAN_PRICE",
+            "TRANSACTION_COUNT": "BASE_TRANSACTION_COUNT",
+        }
+    )
+    candidate = build_monthly_price_volume_trend(
+        candidate_transactions, start_date=start_date, end_date=end_date
+    ).rename(
+        columns={
+            "MEDIAN_PRICE": "CANDIDATE_MEDIAN_PRICE",
+            "TRANSACTION_COUNT": "CANDIDATE_TRANSACTION_COUNT",
+        }
+    )
+    result = base[
+        ["CONTRACT_YEAR_MONTH", "BASE_MEDIAN_PRICE", "BASE_TRANSACTION_COUNT"]
+    ].merge(
+        candidate[
+            [
+                "CONTRACT_YEAR_MONTH",
+                "CANDIDATE_MEDIAN_PRICE",
+                "CANDIDATE_TRANSACTION_COUNT",
+            ]
+        ],
+        on="CONTRACT_YEAR_MONTH",
+        how="inner",
+        validate="one_to_one",
+    )
+    both_observed = result[
+        ["BASE_MEDIAN_PRICE", "CANDIDATE_MEDIAN_PRICE"]
+    ].notna().all(axis=1)
+    result["MONTHLY_GAP"] = (
+        result["CANDIDATE_MEDIAN_PRICE"] - result["BASE_MEDIAN_PRICE"]
+    ).where(both_observed)
+    return result
+
+
 def build_watchlist_transactions(
     df: pd.DataFrame,
     watchlist: pd.DataFrame,

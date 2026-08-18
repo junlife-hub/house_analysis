@@ -6,7 +6,9 @@ from analysis import (
     build_area_group_summary,
     build_monthly_trend,
     build_monthly_price_volume_trend,
+    build_monthly_gap_trend,
     build_price_change_metrics,
+    build_trade_up_gap_comparison,
     build_watchlist_area_comparison,
     build_watchlist_summary,
     determine_analysis_as_of_date,
@@ -48,6 +50,69 @@ def price_scope(amounts_and_dates, *, complex_id="complex-1", area_group="84㎡�
 
 
 class AnalysisTests(unittest.TestCase):
+    def test_trade_up_gap_uses_matching_current_and_previous_periods(self):
+        base = price_scope(
+            [("2026-03-01", 7.0), ("2026-07-01", 8.0)],
+            complex_id="base",
+            area_group="59㎡형",
+        )
+        candidate = price_scope(
+            [("2026-03-01", 13.0), ("2026-07-01", 13.5)],
+            complex_id="candidate",
+            area_group="84㎡형",
+        )
+
+        result = build_trade_up_gap_comparison(
+            base,
+            candidate,
+            analysis_as_of_date="2026-08-14",
+            data_available_from="2025-01-01",
+        )
+
+        self.assertEqual(result["3M"]["current_gap"], 5.5)
+        self.assertEqual(result["3M"]["previous_gap"], 6.0)
+        self.assertEqual(result["3M"]["gap_change"], -0.5)
+        self.assertAlmostEqual(result["3M"]["gap_change_pct"], -100 / 12)
+        self.assertEqual(result["3M"]["gap_change_status"], "축소")
+        self.assertEqual(result["base"]["recent_trade_age_days"], 44)
+
+    def test_trade_up_gap_is_na_when_either_period_has_no_trade(self):
+        base = price_scope(
+            [("2026-03-01", 7.0), ("2026-07-01", 8.0)], complex_id="base"
+        )
+        candidate = price_scope(
+            [("2026-03-01", 13.0)], complex_id="candidate"
+        )
+
+        result = build_trade_up_gap_comparison(
+            base,
+            candidate,
+            analysis_as_of_date="2026-08-14",
+            data_available_from="2025-01-01",
+        )
+
+        self.assertIsNone(result["3M"]["current_gap"])
+        self.assertIsNone(result["3M"]["gap_change"])
+        self.assertEqual(result["3M"]["gap_change_status"], "N/A")
+
+    def test_monthly_gap_does_not_interpolate_missing_prices(self):
+        base = price_scope(
+            [("2026-01-10", 7.0), ("2026-02-10", 8.0)], complex_id="base"
+        )
+        candidate = price_scope(
+            [("2026-02-10", 13.0)], complex_id="candidate"
+        )
+
+        result = build_monthly_gap_trend(
+            base,
+            candidate,
+            start_date="2026-01-01",
+            end_date="2026-02-28",
+        )
+
+        self.assertTrue(pd.isna(result.iloc[0]["MONTHLY_GAP"]))
+        self.assertEqual(result.iloc[1]["MONTHLY_GAP"], 5.0)
+
     def test_watchlist_area_comparison_uses_exact_group_and_shared_metrics(self):
         first = price_scope(
             [("2026-03-01", 10.0), ("2026-07-01", 12.0)],
