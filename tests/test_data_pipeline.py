@@ -63,6 +63,7 @@ class DataPipelineTests(unittest.TestCase):
         self.assertEqual(DEFAULT_ANALYSIS_START_DATE, dt.date(2025, 1, 1))
         self.assertEqual(row["RCPT_YR"], 2026)
         self.assertEqual(row["CTRT_DAY"], pd.Timestamp("2025-12-31"))
+        self.assertEqual(row["CONTRACT_DATE"], pd.Timestamp("2025-12-31"))
         self.assertEqual(row["CONTRACT_YEAR"], 2025)
         self.assertEqual(row["CONTRACT_MONTH"], 12)
         self.assertEqual(row["CONTRACT_YEAR_MONTH"], "2025-12")

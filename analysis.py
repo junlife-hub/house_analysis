@@ -134,6 +134,236 @@ def build_area_group_summary(transactions: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def _contract_dates(transactions: pd.DataFrame) -> pd.Series:
+    date_column = (
+        "CONTRACT_DATE"
+        if "CONTRACT_DATE" in transactions.columns
+        else "CTRT_DAY"
+    )
+    if date_column not in transactions.columns:
+        raise ValueError("기간 분석에 CONTRACT_DATE 또는 CTRT_DAY 컬럼이 필요합니다.")
+    return pd.to_datetime(transactions[date_column], errors="coerce")
+
+
+def determine_analysis_as_of_date(transactions: pd.DataFrame) -> pd.Timestamp | None:
+    """Return the shared latest contract date across the effective dataset."""
+    if transactions.empty:
+        return None
+    latest = _contract_dates(transactions).max()
+    return None if pd.isna(latest) else pd.Timestamp(latest).normalize()
+
+
+def sample_size_status(transaction_count: int) -> str:
+    """User-facing sample-size notice, not a statistical confidence grade."""
+    if transaction_count <= 0:
+        return "거래 없음"
+    if transaction_count <= 2:
+        return "표본 적음"
+    return "일반"
+
+
+def build_period_price_metrics(
+    transactions: pd.DataFrame,
+    start_date: str | pd.Timestamp,
+    end_date: str | pd.Timestamp,
+) -> dict:
+    """Summarize contract prices for one inclusive rolling date period."""
+    start = pd.Timestamp(start_date).normalize()
+    end = pd.Timestamp(end_date).normalize()
+    if start > end:
+        raise ValueError("기간 시작일은 종료일보다 늦을 수 없습니다.")
+    if "THING_AMT" not in transactions.columns:
+        raise ValueError("기간 분석에 THING_AMT 컬럼이 필요합니다.")
+
+    dates = _contract_dates(transactions)
+    period = transactions.loc[dates.between(start, end, inclusive="both")]
+    count = int(len(period))
+    prices = pd.to_numeric(period["THING_AMT"], errors="coerce").dropna()
+    return {
+        "start_date": start,
+        "end_date": end,
+        "transaction_count": count,
+        "median_price": float(prices.median()) if not prices.empty else None,
+        "mean_price": float(prices.mean()) if not prices.empty else None,
+        "lowest_price": float(prices.min()) if not prices.empty else None,
+        "highest_price": float(prices.max()) if not prices.empty else None,
+        "sample_status": sample_size_status(count),
+    }
+
+
+def _comparison_metrics(current: dict, previous: dict | None) -> dict:
+    if previous is None:
+        return {
+            "price_change_amount": None,
+            "price_change_pct": None,
+            "volume_change": None,
+            "volume_change_pct": None,
+        }
+    current_price = current["median_price"]
+    previous_price = previous["median_price"]
+    price_change_amount = (
+        current_price - previous_price
+        if current_price is not None and previous_price is not None
+        else None
+    )
+    price_change_pct = (
+        (current_price / previous_price - 1) * 100
+        if current_price is not None
+        and previous_price is not None
+        and previous_price != 0
+        else None
+    )
+    previous_count = previous["transaction_count"]
+    volume_change = current["transaction_count"] - previous_count
+    volume_change_pct = (
+        (current["transaction_count"] / previous_count - 1) * 100
+        if previous_count > 0
+        else None
+    )
+    return {
+        "price_change_amount": price_change_amount,
+        "price_change_pct": price_change_pct,
+        "volume_change": volume_change,
+        "volume_change_pct": volume_change_pct,
+    }
+
+
+def _rolling_period_bounds(
+    analysis_as_of_date: pd.Timestamp,
+    months: int,
+) -> tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp, pd.Timestamp]:
+    as_of = pd.Timestamp(analysis_as_of_date).normalize()
+    boundary = as_of - pd.DateOffset(months=months)
+    previous_boundary = as_of - pd.DateOffset(months=months * 2)
+    current_start = boundary + pd.Timedelta(days=1)
+    previous_start = previous_boundary + pd.Timedelta(days=1)
+    return current_start, as_of, previous_start, boundary
+
+
+def _validate_price_analysis_scope(transactions: pd.DataFrame) -> None:
+    for column, label in [("COMPLEX_ID", "단지"), ("AREA_GROUP", "면적 그룹")]:
+        if column not in transactions.columns:
+            raise ValueError(f"가격 변화 분석에 {column} 컬럼이 필요합니다.")
+        values = transactions[column].dropna().unique()
+        if len(values) > 1:
+            raise ValueError(f"가격 변화 분석에는 하나의 {label}만 사용할 수 있습니다.")
+
+
+def build_price_change_metrics(
+    transactions: pd.DataFrame,
+    *,
+    analysis_as_of_date: str | pd.Timestamp,
+    data_available_from: str | pd.Timestamp,
+) -> dict:
+    """Build 3M/6M/12M price and volume metrics for one complex-area unit."""
+    _validate_price_analysis_scope(transactions)
+    as_of = pd.Timestamp(analysis_as_of_date).normalize()
+    available_from = pd.Timestamp(data_available_from).normalize()
+    eligible_dates = _contract_dates(transactions)
+    eligible = transactions.loc[eligible_dates.le(as_of)].copy()
+    latest = (
+        eligible.assign(_CONTRACT_DATE=eligible_dates.loc[eligible.index])
+        .sort_values("_CONTRACT_DATE", kind="stable")
+        .iloc[-1]
+        if not eligible.empty
+        else None
+    )
+
+    result = {
+        "analysis_as_of_date": as_of,
+        "latest_contract_date": (
+            pd.Timestamp(latest["_CONTRACT_DATE"]).normalize()
+            if latest is not None
+            else None
+        ),
+        "latest_price": float(latest["THING_AMT"]) if latest is not None else None,
+    }
+    for months in (3, 6):
+        current_start, current_end, previous_start, previous_end = (
+            _rolling_period_bounds(as_of, months)
+        )
+        current = build_period_price_metrics(
+            eligible, current_start, current_end
+        )
+        previous = build_period_price_metrics(
+            eligible, previous_start, previous_end
+        )
+        result[f"{months}M"] = {
+            "current": current,
+            "previous": previous,
+            **_comparison_metrics(current, previous),
+        }
+
+    current_start, current_end, previous_start, previous_end = (
+        _rolling_period_bounds(as_of, 12)
+    )
+    current_12m = build_period_price_metrics(eligible, current_start, current_end)
+    previous_coverage_complete = available_from <= previous_start
+    previous_12m = (
+        build_period_price_metrics(eligible, previous_start, previous_end)
+        if previous_coverage_complete
+        else None
+    )
+    twelve_month_comparison = _comparison_metrics(current_12m, previous_12m)
+    recent_3m_price = result["3M"]["current"]["median_price"]
+    twelve_month_high = current_12m["highest_price"]
+    high_gap_amount = (
+        recent_3m_price - twelve_month_high
+        if recent_3m_price is not None and twelve_month_high is not None
+        else None
+    )
+    high_gap_pct = (
+        (recent_3m_price / twelve_month_high - 1) * 100
+        if recent_3m_price is not None
+        and twelve_month_high is not None
+        and twelve_month_high != 0
+        else None
+    )
+    result["12M"] = {
+        "current": current_12m,
+        "previous": previous_12m,
+        "previous_coverage_complete": previous_coverage_complete,
+        **twelve_month_comparison,
+        "high_gap_amount": high_gap_amount,
+        "high_gap_pct": high_gap_pct,
+    }
+    return result
+
+
+def build_monthly_price_volume_trend(
+    transactions: pd.DataFrame,
+    *,
+    start_date: str | pd.Timestamp,
+    end_date: str | pd.Timestamp,
+) -> pd.DataFrame:
+    """Return complete monthly price/volume rows without price interpolation."""
+    _validate_price_analysis_scope(transactions)
+    start = pd.Timestamp(start_date).normalize()
+    end = pd.Timestamp(end_date).normalize()
+    if start > end:
+        raise ValueError("월별 추세 시작일은 종료일보다 늦을 수 없습니다.")
+
+    month_index = pd.period_range(start=start, end=end, freq="M")
+    dates = _contract_dates(transactions)
+    eligible = transactions.loc[dates.between(start, end, inclusive="both")].copy()
+    eligible["_MONTH"] = dates.loc[eligible.index].dt.to_period("M")
+    monthly = eligible.groupby("_MONTH").agg(
+        TRANSACTION_COUNT=("THING_AMT", "size"),
+        MEDIAN_PRICE=("THING_AMT", "median"),
+        MEAN_PRICE=("THING_AMT", "mean"),
+        LOWEST_PRICE=("THING_AMT", "min"),
+        HIGHEST_PRICE=("THING_AMT", "max"),
+    )
+    monthly = monthly.reindex(month_index)
+    monthly["TRANSACTION_COUNT"] = (
+        monthly["TRANSACTION_COUNT"].fillna(0).astype(int)
+    )
+    monthly.index.name = "CONTRACT_YEAR_MONTH"
+    result = monthly.reset_index()
+    result["CONTRACT_YEAR_MONTH"] = result["CONTRACT_YEAR_MONTH"].astype(str)
+    return result
+
+
 def build_watchlist_transactions(
     df: pd.DataFrame,
     watchlist: pd.DataFrame,

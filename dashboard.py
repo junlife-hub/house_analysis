@@ -14,7 +14,10 @@ from dotenv import load_dotenv
 from analysis import (
     build_area_group_summary,
     build_monthly_trend,
+    build_monthly_price_volume_trend,
+    build_price_change_metrics,
     build_watchlist_summary,
+    determine_analysis_as_of_date,
     filter_area_group,
     filter_complex_transactions,
     load_watchlist,
@@ -207,6 +210,187 @@ def render_monthly_chart(
                 na_rep="-",
             ),
             width="stretch",
+        )
+
+
+def format_optional_money(value: object, *, signed: bool = False) -> str:
+    if value is None or pd.isna(value):
+        return "-"
+    numeric = float(value)
+    return f"{numeric:+.2f}억" if signed else f"{numeric:.2f}억"
+
+
+def format_optional_pct(value: object) -> str:
+    if value is None or pd.isna(value):
+        return "-"
+    return f"{float(value):+.1f}%"
+
+
+def render_period_change_metrics(label: str, period: dict) -> None:
+    current = period["current"]
+    previous = period["previous"]
+    st.markdown(f"#### 최근 {label}")
+    st.caption(
+        f"최근 {current['start_date']:%Y-%m-%d} ~ {current['end_date']:%Y-%m-%d} · "
+        f"직전 {previous['start_date']:%Y-%m-%d} ~ {previous['end_date']:%Y-%m-%d}"
+    )
+    columns = st.columns(5)
+    columns[0].metric(
+        "중앙값",
+        format_optional_money(current["median_price"]),
+        help=f"표본 상태: {current['sample_status']}",
+    )
+    columns[1].metric(
+        "거래건수",
+        f"{current['transaction_count']:,}건",
+        delta=f"직전 {previous['transaction_count']:,}건",
+        help="0건=거래 없음, 1~2건=표본 적음, 3건 이상=일반 표시",
+    )
+    columns[2].metric(
+        "중앙값 변화",
+        format_optional_money(period["price_change_amount"], signed=True),
+    )
+    columns[3].metric(
+        "변화율",
+        format_optional_pct(period["price_change_pct"]),
+    )
+    columns[4].metric(
+        "거래량 변화",
+        f"{period['volume_change']:+,}건",
+    )
+    if current["sample_status"] != "일반":
+        st.warning(
+            f"최근 {label} 표본 상태: {current['sample_status']}. "
+            "이 표시는 통계적 신뢰구간이 아니라 표본 수 인지용 경고입니다."
+        )
+
+
+def render_price_volume_analysis(
+    transactions: pd.DataFrame,
+    *,
+    analysis_as_of_date: pd.Timestamp,
+    data_available_from: pd.Timestamp,
+    scope_label: str,
+) -> None:
+    metrics = build_price_change_metrics(
+        transactions,
+        analysis_as_of_date=analysis_as_of_date,
+        data_available_from=data_available_from,
+    )
+    st.markdown("### 가격·거래량 변화")
+    st.caption(
+        f"모든 단지 공통 분석 기준일: {analysis_as_of_date:%Y-%m-%d} · "
+        "가격 변화 대표값은 거래금액 중앙값"
+    )
+    current_columns = st.columns(4)
+    current_columns[0].metric("선택 분석단위", scope_label)
+    current_columns[1].metric(
+        "최근 유효 거래일", format_date(metrics["latest_contract_date"])
+    )
+    current_columns[2].metric(
+        "최근 실거래가", format_optional_money(metrics["latest_price"])
+    )
+    current_columns[3].metric("공통 기준일", f"{analysis_as_of_date:%Y-%m-%d}")
+
+    render_period_change_metrics("3개월", metrics["3M"])
+    render_period_change_metrics("6개월", metrics["6M"])
+
+    twelve = metrics["12M"]
+    current_12m = twelve["current"]
+    st.markdown("#### 최근 12개월 가격 수준")
+    st.caption(
+        f"{current_12m['start_date']:%Y-%m-%d} ~ "
+        f"{current_12m['end_date']:%Y-%m-%d}"
+    )
+    twelve_columns = st.columns(6)
+    twelve_columns[0].metric(
+        "중앙값", format_optional_money(current_12m["median_price"])
+    )
+    twelve_columns[1].metric(
+        "거래건수",
+        f"{current_12m['transaction_count']:,}건",
+        help=f"표본 상태: {current_12m['sample_status']}",
+    )
+    twelve_columns[2].metric(
+        "최고가", format_optional_money(current_12m["highest_price"])
+    )
+    twelve_columns[3].metric(
+        "최저가", format_optional_money(current_12m["lowest_price"])
+    )
+    twelve_columns[4].metric(
+        "고점 대비 GAP",
+        format_optional_money(twelve["high_gap_amount"], signed=True),
+    )
+    twelve_columns[5].metric(
+        "고점 대비",
+        format_optional_pct(twelve["high_gap_pct"]),
+    )
+    if twelve["previous_coverage_complete"]:
+        st.caption(
+            "직전 12개월 대비 변화율: "
+            f"{format_optional_pct(twelve['price_change_pct'])}"
+        )
+    else:
+        st.info(
+            "직전 12개월 전체 데이터가 없어 12개월 변화율은 N/A입니다. "
+            "불완전한 기간의 중앙값은 비교에 사용하지 않았습니다."
+        )
+
+    trend_start = (
+        analysis_as_of_date.to_period("M") - 11
+    ).start_time.normalize()
+    trend = build_monthly_price_volume_trend(
+        transactions,
+        start_date=trend_start,
+        end_date=analysis_as_of_date,
+    )
+    st.markdown("#### 월별 가격·거래량 추세")
+    price_figure = px.line(
+        trend,
+        x="CONTRACT_YEAR_MONTH",
+        y=["MEDIAN_PRICE", "MEAN_PRICE"],
+        markers=True,
+        labels={
+            "CONTRACT_YEAR_MONTH": "계약연월",
+            "value": "거래금액(억)",
+            "variable": "가격지표",
+        },
+        title=f"{scope_label} 월별 중앙값·평균",
+    )
+    st.plotly_chart(price_figure, width="stretch")
+    volume_figure = px.bar(
+        trend,
+        x="CONTRACT_YEAR_MONTH",
+        y="TRANSACTION_COUNT",
+        labels={
+            "CONTRACT_YEAR_MONTH": "계약연월",
+            "TRANSACTION_COUNT": "거래건수",
+        },
+        title=f"{scope_label} 월별 거래량",
+    )
+    st.plotly_chart(volume_figure, width="stretch")
+    with st.expander("월별 가격·거래량 집계표"):
+        st.dataframe(
+            trend.rename(
+                columns={
+                    "CONTRACT_YEAR_MONTH": "계약연월",
+                    "TRANSACTION_COUNT": "거래건수",
+                    "MEDIAN_PRICE": "중앙값(억)",
+                    "MEAN_PRICE": "평균(억)",
+                    "LOWEST_PRICE": "최저가(억)",
+                    "HIGHEST_PRICE": "최고가(억)",
+                }
+            ).style.format(
+                {
+                    "중앙값(억)": "{:.2f}",
+                    "평균(억)": "{:.2f}",
+                    "최저가(억)": "{:.2f}",
+                    "최고가(억)": "{:.2f}",
+                },
+                na_rep="-",
+            ),
+            width="stretch",
+            hide_index=True,
         )
 
 
@@ -445,7 +629,12 @@ with tabs[1]:
 
 with tabs[2]:
     st.header("관심단지 갈아타기 비교")
-    as_of = pd.Timestamp(status["last_date"])
+    analysis_as_of_date = determine_analysis_as_of_date(df)
+    if analysis_as_of_date is None:
+        st.error("분석 기준 계약일을 결정할 수 없습니다.")
+        st.stop()
+    as_of = analysis_as_of_date
+    data_available_from = pd.Timestamp(df["CONTRACT_DATE"].min()).normalize()
     summary = build_watchlist_summary(df, watchlist, as_of)
     reference = summary[summary["단지명"] == "태강아파트"].iloc[0]
     candidates = summary[summary["단지명"] != "태강아파트"]
@@ -608,11 +797,25 @@ with tabs[2]:
             f"{selected_transactions['THING_AMT'].min():.2f}~"
             f"{selected_transactions['THING_AMT'].max():.2f}억",
         )
-    render_monthly_chart(
-        selected_transactions,
-        title_prefix=scope_label,
-        key_prefix="watchlist",
-    )
+    if selected_area_group == "전체":
+        st.info(
+            "가격 변화 분석은 서로 다른 면적이 섞이지 않도록 개별 전용면적 그룹을 "
+            "선택했을 때 제공됩니다. 전체 조회에서는 기존 월별 추세를 표시합니다."
+        )
+        render_monthly_chart(
+            selected_transactions,
+            title_prefix=scope_label,
+            key_prefix="watchlist",
+        )
+    elif selected_transactions.empty:
+        st.info(f"{scope_label}의 기간 분석 대상 거래가 없습니다.")
+    else:
+        render_price_volume_analysis(
+            selected_transactions,
+            analysis_as_of_date=analysis_as_of_date,
+            data_available_from=data_available_from,
+            scope_label=scope_label,
+        )
 
     st.subheader("상세 거래내역")
     if selected_transactions.empty:

@@ -281,6 +281,7 @@ def preprocess_data(
 
     cleaned["CONTRACT_YEAR"] = cleaned["CTRT_DAY"].dt.year.astype("Int64")
     cleaned["CONTRACT_MONTH"] = cleaned["CTRT_DAY"].dt.month.astype("Int64")
+    cleaned["CONTRACT_DATE"] = cleaned["CTRT_DAY"]
     cleaned["CONTRACT_YEAR_MONTH"] = (
         cleaned["CTRT_DAY"].dt.to_period("M").astype(str)
     )
