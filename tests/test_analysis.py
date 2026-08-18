@@ -7,6 +7,7 @@ from analysis import (
     build_monthly_trend,
     build_monthly_price_volume_trend,
     build_price_change_metrics,
+    build_watchlist_area_comparison,
     build_watchlist_summary,
     determine_analysis_as_of_date,
     filter_area_group,
@@ -47,6 +48,55 @@ def price_scope(amounts_and_dates, *, complex_id="complex-1", area_group="84㎡�
 
 
 class AnalysisTests(unittest.TestCase):
+    def test_watchlist_area_comparison_uses_exact_group_and_shared_metrics(self):
+        first = price_scope(
+            [("2026-03-01", 10.0), ("2026-07-01", 12.0)],
+            complex_id="complex-1",
+        )
+        second = price_scope(
+            [("2026-06-01", 20.0)],
+            complex_id="complex-2",
+            area_group="59㎡형",
+        )
+        watchlist = pd.DataFrame(
+            [
+                {
+                    "display_name": "첫 단지",
+                    "role": "현재보유",
+                    "complex_id": "complex-1",
+                },
+                {
+                    "display_name": "둘째 단지",
+                    "role": "관심단지",
+                    "complex_id": "complex-2",
+                },
+            ]
+        )
+        as_of = pd.Timestamp("2026-08-14")
+
+        comparison = build_watchlist_area_comparison(
+            pd.concat([first, second], ignore_index=True),
+            watchlist,
+            area_group="84㎡형",
+            analysis_as_of_date=as_of,
+            data_available_from="2025-01-01",
+        )
+        direct = build_price_change_metrics(
+            first,
+            analysis_as_of_date=as_of,
+            data_available_from="2025-01-01",
+        )
+
+        self.assertEqual(comparison["WATCHLIST_NAME"].tolist(), ["첫 단지", "둘째 단지"])
+        first_row, missing_row = comparison.iloc[0], comparison.iloc[1]
+        self.assertEqual(first_row["3M_CHANGE_PCT"], direct["3M"]["price_change_pct"])
+        self.assertEqual(first_row["CURRENT_6M_COUNT"], direct["6M"]["current"]["transaction_count"])
+        self.assertEqual(first_row["RECENT_TRADE_AGE_DAYS"], 44)
+        self.assertEqual(first_row["RECENT_TRADE_STATUS"], "거래 간격 있음")
+        self.assertFalse(bool(missing_row["AREA_AVAILABLE"]))
+        self.assertEqual(missing_row["RECENT_TRADE_STATUS"], "해당 평형 없음")
+        self.assertTrue(pd.isna(missing_row["RECENT_PRICE"]))
+
     def test_sample_size_status_is_an_awareness_warning(self):
         self.assertEqual(sample_size_status(0), "거래 없음")
         self.assertEqual(sample_size_status(1), "표본 적음")

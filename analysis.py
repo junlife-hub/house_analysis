@@ -364,6 +364,100 @@ def build_monthly_price_volume_trend(
     return result
 
 
+def recent_trade_status(age_days: int | None) -> str:
+    """Return a recency notice; this is not a price-confidence score."""
+    if age_days is None:
+        return "거래 없음"
+    if age_days <= 30:
+        return "최근 거래"
+    if age_days <= 90:
+        return "거래 간격 있음"
+    return "최근 거래 오래됨"
+
+
+def build_watchlist_area_comparison(
+    transactions: pd.DataFrame,
+    watchlist: pd.DataFrame,
+    *,
+    area_group: str,
+    analysis_as_of_date: str | pd.Timestamp,
+    data_available_from: str | pd.Timestamp,
+) -> pd.DataFrame:
+    """Compare one exact AREA_GROUP across Watchlist complexes at one as-of date."""
+    if not area_group or area_group == "전체":
+        raise ValueError("Watchlist 전체 비교에는 하나의 AREA_GROUP이 필요합니다.")
+
+    as_of = pd.Timestamp(analysis_as_of_date).normalize()
+    rows = []
+    for order, (_, config) in enumerate(watchlist.iterrows()):
+        complex_transactions = filter_complex_transactions(transactions, config)
+        scoped = filter_area_group(complex_transactions, area_group)
+        base = {
+            "WATCHLIST_ORDER": order,
+            "WATCHLIST_NAME": config["display_name"],
+            "WATCHLIST_ROLE": config.get("role", ""),
+            "AREA_GROUP": area_group,
+            "AREA_AVAILABLE": not scoped.empty,
+        }
+        if scoped.empty:
+            rows.append(
+                {
+                    **base,
+                    "RECENT_CONTRACT_DATE": pd.NaT,
+                    "RECENT_PRICE": None,
+                    "RECENT_TRADE_AGE_DAYS": None,
+                    "RECENT_TRADE_STATUS": "해당 평형 없음",
+                }
+            )
+            continue
+
+        metrics = build_price_change_metrics(
+            scoped,
+            analysis_as_of_date=as_of,
+            data_available_from=data_available_from,
+        )
+        latest_date = metrics["latest_contract_date"]
+        age_days = int((as_of - latest_date).days) if latest_date is not None else None
+        row = {
+            **base,
+            "RECENT_CONTRACT_DATE": latest_date,
+            "RECENT_PRICE": metrics["latest_price"],
+            "RECENT_TRADE_AGE_DAYS": age_days,
+            "RECENT_TRADE_STATUS": recent_trade_status(age_days),
+        }
+        for months in (3, 6):
+            period = metrics[f"{months}M"]
+            row.update(
+                {
+                    f"CURRENT_{months}M_MEDIAN": period["current"]["median_price"],
+                    f"PREVIOUS_{months}M_MEDIAN": period["previous"]["median_price"],
+                    f"{months}M_CHANGE_AMOUNT": period["price_change_amount"],
+                    f"{months}M_CHANGE_PCT": period["price_change_pct"],
+                    f"CURRENT_{months}M_COUNT": period["current"]["transaction_count"],
+                    f"PREVIOUS_{months}M_COUNT": period["previous"]["transaction_count"],
+                    f"{months}M_VOLUME_CHANGE": period["volume_change"],
+                    f"{months}M_SAMPLE_STATUS": period["current"]["sample_status"],
+                }
+            )
+        twelve_month = metrics["12M"]
+        row.update(
+            {
+                "CURRENT_12M_MEDIAN": twelve_month["current"]["median_price"],
+                "CURRENT_12M_COUNT": twelve_month["current"]["transaction_count"],
+                "CURRENT_12M_HIGH": twelve_month["current"]["highest_price"],
+                "CURRENT_12M_LOW": twelve_month["current"]["lowest_price"],
+                "12M_CHANGE_PCT": twelve_month["price_change_pct"],
+                "HIGH_GAP_AMOUNT": twelve_month["high_gap_amount"],
+                "HIGH_GAP_PCT": twelve_month["high_gap_pct"],
+            }
+        )
+        rows.append(row)
+
+    return pd.DataFrame(rows).sort_values(
+        "WATCHLIST_ORDER", kind="stable", ignore_index=True
+    )
+
+
 def build_watchlist_transactions(
     df: pd.DataFrame,
     watchlist: pd.DataFrame,
