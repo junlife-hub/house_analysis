@@ -22,6 +22,7 @@ from analysis import (
 from data_pipeline import (
     DEFAULT_ANALYSIS_START_DATE,
     assign_area_group,
+    assign_complex_identity,
     build_effective_transactions,
     build_data_status,
     combine_raw_data,
@@ -99,6 +100,7 @@ def load_cached_stored_data(
     )
     effective, cancellation_quality = build_effective_transactions(prepared)
     effective = assign_area_group(effective)
+    effective = assign_complex_identity(effective)
     return effective, {**quality, **cancellation_quality}
 
 
@@ -240,6 +242,7 @@ if data_mode == api_mode_label:
                 )
                 df, cancellation_quality = build_effective_transactions(prepared)
                 df = assign_area_group(df)
+                df = assign_complex_identity(df)
                 quality = {**quality, **cancellation_quality}
                 st.sidebar.success(
                     f"{CURRENT_RECEIPT_YEAR}년 접수 API {len(api_raw):,}건 병합 · "
@@ -525,6 +528,25 @@ with tabs[2]:
     selected_name = st.selectbox("관심단지 선택", watchlist["display_name"].tolist())
     selected_config = watchlist[watchlist["display_name"] == selected_name].iloc[0]
     complex_transactions = filter_complex_transactions(df, selected_config)
+    identity_columns = [
+        column
+        for column in [
+            "COMPLEX_ID",
+            "COMPLEX_NAME",
+            "BLDG_NM",
+            "CGG_NM",
+            "STDG_NM",
+            "MNO",
+            "SNO",
+        ]
+        if column in complex_transactions.columns
+    ]
+    with st.expander("단지 식별 정보"):
+        st.dataframe(
+            complex_transactions[identity_columns].drop_duplicates(),
+            width="stretch",
+            hide_index=True,
+        )
     area_summary = build_area_group_summary(complex_transactions)
     if not area_summary.empty:
         area_overview = area_summary[
@@ -599,7 +621,9 @@ with tabs[2]:
         details = selected_transactions.sort_values("CTRT_DAY", ascending=False)[
             [
                 "CTRT_DAY",
+                "COMPLEX_NAME",
                 "BLDG_NM",
+                "COMPLEX_ID",
                 "AREA_GROUP",
                 "THING_AMT",
                 "ARCH_AREA",
@@ -610,7 +634,9 @@ with tabs[2]:
         ].rename(
             columns={
                 "CTRT_DAY": "계약일",
+                "COMPLEX_NAME": "표준 단지명",
                 "BLDG_NM": "API 단지명",
+                "COMPLEX_ID": "단지 식별자",
                 "AREA_GROUP": "면적그룹",
                 "THING_AMT": "거래금액(억)",
                 "ARCH_AREA": "전용면적(㎡)",

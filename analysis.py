@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 import pandas as pd
+
+from data_pipeline import normalize_complex_name
 
 
 WATCHLIST_REQUIRED_COLUMNS = {
@@ -17,9 +18,8 @@ WATCHLIST_REQUIRED_COLUMNS = {
 
 
 def normalize_name(value: object) -> str:
-    if pd.isna(value):
-        return ""
-    return re.sub(r"[^0-9a-z가-힣]", "", str(value).lower())
+    """Backward-compatible alias for the shared complex-name normalizer."""
+    return normalize_complex_name(value)
 
 
 def load_watchlist(path: str | Path) -> pd.DataFrame:
@@ -36,6 +36,12 @@ def filter_complex_transactions(df: pd.DataFrame, config: pd.Series) -> pd.DataF
     if df.empty:
         return df.copy()
 
+    configured_complex_id = str(config.get("complex_id", "")).strip()
+    if configured_complex_id:
+        if "COMPLEX_ID" not in df.columns:
+            raise ValueError("명시적 complex_id 매칭에 COMPLEX_ID 컬럼이 필요합니다.")
+        return df.loc[df["COMPLEX_ID"].eq(configured_complex_id)].copy()
+
     building_keyword = normalize_name(config["building_keyword"])
     normalized_buildings = df["BLDG_NM"].map(normalize_name)
     mask = normalized_buildings.str.contains(building_keyword, regex=False, na=False)
@@ -48,7 +54,20 @@ def filter_complex_transactions(df: pd.DataFrame, config: pd.Series) -> pd.DataF
     if dong_name and "STDG_NM" in df.columns:
         mask &= df["STDG_NM"].map(normalize_name).eq(dong_name)
 
-    return df.loc[mask].copy()
+    candidates = df.loc[mask].copy()
+    if "COMPLEX_ID" not in candidates.columns or candidates.empty:
+        return candidates
+
+    candidate_ids = candidates["COMPLEX_ID"].dropna().unique().tolist()
+    if len(candidate_ids) > 1:
+        raise ValueError(
+            f"Watchlist 설정 '{config.get('display_name', building_keyword)}'이 "
+            f"서로 다른 COMPLEX_ID {len(candidate_ids)}개와 매칭됩니다. "
+            "지역·지번 또는 complex_id를 명시하세요."
+        )
+    if len(candidate_ids) == 1:
+        return df.loc[df["COMPLEX_ID"].eq(candidate_ids[0])].copy()
+    return candidates
 
 
 def filter_area_group(

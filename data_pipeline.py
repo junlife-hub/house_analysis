@@ -4,6 +4,7 @@ import datetime as dt
 import json
 import os
 import re
+import unicodedata
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Iterable
 
@@ -83,6 +84,28 @@ class SeoulApiError(RuntimeError):
 
 def current_year(today: dt.date | None = None) -> int:
     return (today or dt.date.today()).year
+
+
+def normalize_complex_name(value: object) -> str:
+    """Normalize formatting while preserving meaningful letters and numbers."""
+    if pd.isna(value):
+        return ""
+    normalized = unicodedata.normalize("NFKC", str(value)).lower()
+    return re.sub(r"[^0-9a-z가-힣]", "", normalized)
+
+
+def _normalize_identifier_number(value: object, *, missing: str = "na") -> str:
+    if pd.isna(value) or not str(value).strip():
+        return missing
+    try:
+        numeric = float(str(value).replace(",", ""))
+    except (TypeError, ValueError):
+        numeric = float("nan")
+    if np.isfinite(numeric):
+        if abs(float(numeric) - round(float(numeric))) < 1e-9:
+            return str(int(round(float(numeric))))
+        return format(float(numeric), ".12g")
+    return normalize_complex_name(value) or missing
 
 
 def _receipt_year_from_filename(path: Path) -> int | None:
@@ -312,6 +335,102 @@ def assign_area_group(df: pd.DataFrame) -> pd.DataFrame:
     grouped["AREA_GROUP"] = nominal.astype("string") + "㎡형"
     grouped.loc[~valid, "AREA_GROUP"] = pd.NA
     return grouped
+
+
+def assign_complex_identity(df: pd.DataFrame) -> pd.DataFrame:
+    """Add a conservative analysis-only complex identity to valid addresses.
+
+    A complex ID combines district and legal-dong codes, lot type, normalized
+    main/sub lot numbers, and a formatting-normalized building name.  Rows
+    without a building name or main lot number remain unidentified rather than
+    being merged at the legal-dong level.
+    """
+    identified = df.copy()
+    if "BLDG_NM" not in identified.columns:
+        raise ValueError("단지 식별에 BLDG_NM 컬럼이 필요합니다.")
+
+    raw_names = identified["BLDG_NM"].astype("string").str.strip()
+    normalized_names = identified["BLDG_NM"].map(normalize_complex_name)
+
+    def component(code_column: str, name_column: str) -> pd.Series:
+        codes = (
+            identified[code_column]
+            if code_column in identified.columns
+            else pd.Series(pd.NA, index=identified.index)
+        )
+        names = (
+            identified[name_column]
+            if name_column in identified.columns
+            else pd.Series(pd.NA, index=identified.index)
+        )
+        values = []
+        for code, name in zip(codes, names):
+            normalized_code = _normalize_identifier_number(code)
+            values.append(
+                normalized_code
+                if normalized_code != "na"
+                else normalize_complex_name(name) or "na"
+            )
+        return pd.Series(values, index=identified.index, dtype="string")
+
+    district = component("CGG_CD", "CGG_NM")
+    legal_dong = component("STDG_CD", "STDG_NM")
+    lot_type = identified.get(
+        "LOTNO_SE", pd.Series(pd.NA, index=identified.index)
+    ).map(_normalize_identifier_number)
+    main_lot = identified.get(
+        "MNO", pd.Series(pd.NA, index=identified.index)
+    ).map(_normalize_identifier_number)
+    sub_lot = identified.get(
+        "SNO", pd.Series(pd.NA, index=identified.index)
+    ).map(lambda value: _normalize_identifier_number(value, missing="0"))
+
+    valid = (
+        normalized_names.ne("")
+        & district.ne("na")
+        & legal_dong.ne("na")
+        & main_lot.ne("na")
+        & main_lot.ne("0")
+    )
+    complex_id = pd.Series(pd.NA, index=identified.index, dtype="string")
+    complex_id.loc[valid] = (
+        "cgg="
+        + district.loc[valid]
+        + "|stdg="
+        + legal_dong.loc[valid]
+        + "|lot="
+        + lot_type.loc[valid]
+        + "|mno="
+        + main_lot.loc[valid]
+        + "|sno="
+        + sub_lot.loc[valid]
+        + "|name="
+        + normalized_names.loc[valid]
+    )
+    identified["COMPLEX_ID"] = complex_id
+    identified["COMPLEX_NAME"] = raw_names
+
+    if valid.any():
+        name_counts = (
+            identified.loc[valid, ["COMPLEX_ID", "BLDG_NM"]]
+            .groupby(["COMPLEX_ID", "BLDG_NM"], sort=False)
+            .size()
+            .rename("ROW_COUNT")
+            .reset_index()
+        )
+        representatives = (
+            name_counts.sort_values(
+                ["COMPLEX_ID", "ROW_COUNT", "BLDG_NM"],
+                ascending=[True, False, True],
+                kind="stable",
+            )
+            .drop_duplicates("COMPLEX_ID")
+            .set_index("COMPLEX_ID")["BLDG_NM"]
+        )
+        identified.loc[valid, "COMPLEX_NAME"] = complex_id.loc[valid].map(
+            representatives
+        )
+    return identified
 
 
 def build_effective_transactions(

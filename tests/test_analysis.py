@@ -30,6 +30,45 @@ def transactions(name, amounts_and_dates):
 
 
 class AnalysisTests(unittest.TestCase):
+    def test_watchlist_does_not_silently_merge_multiple_complex_ids(self):
+        data = pd.DataFrame(
+            {
+                "BLDG_NM": ["현대", "현대"],
+                "CGG_NM": ["테스트구", "테스트구"],
+                "STDG_NM": ["테스트동", "테스트동"],
+                "COMPLEX_ID": ["complex-1", "complex-2"],
+            }
+        )
+        config = pd.Series(
+            {
+                "display_name": "현대",
+                "building_keyword": "현대",
+                "district_name": "테스트구",
+                "dong_name": "테스트동",
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "서로 다른 COMPLEX_ID 2개"):
+            filter_complex_transactions(data, config)
+
+    def test_watchlist_can_use_explicit_complex_id(self):
+        data = pd.DataFrame(
+            {
+                "BLDG_NM": ["현대", "현대"],
+                "COMPLEX_ID": ["complex-1", "complex-2"],
+            }
+        )
+        config = pd.Series(
+            {
+                "complex_id": "complex-2",
+                "building_keyword": "사용하지않음",
+            }
+        )
+
+        matched = filter_complex_transactions(data, config)
+
+        self.assertEqual(matched["COMPLEX_ID"].tolist(), ["complex-2"])
+
     def test_area_group_summary_preserves_rare_groups_and_total_count(self):
         data = pd.DataFrame(
             {

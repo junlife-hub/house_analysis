@@ -7,12 +7,14 @@ from data_pipeline import (
     DEFAULT_ANALYSIS_START_DATE,
     SERVICE_NAME,
     assign_area_group,
+    assign_complex_identity,
     build_effective_transactions,
     build_data_status,
     combine_raw_data,
     count_repeated_source_rows,
     current_year,
     fetch_api_data,
+    normalize_complex_name,
     preprocess_data,
 )
 
@@ -130,6 +132,57 @@ class DataPipelineTests(unittest.TestCase):
         self.assertEqual(len(grouped), 1)
         self.assertEqual(grouped.iloc[0]["AREA_GROUP"], "59㎡형")
         self.assertNotIn("84㎡형", grouped["AREA_GROUP"].tolist())
+
+    def test_complex_identity_normalizes_formatting_and_numeric_lot_types(self):
+        source = pd.DataFrame(
+            {
+                "CGG_CD": [11200, "11200.0"],
+                "CGG_NM": ["성동구", "성동구"],
+                "STDG_CD": [10700, "10700.0"],
+                "STDG_NM": ["행당동", "행당동"],
+                "LOTNO_SE": [1, "1.0"],
+                "MNO": [349, "349.0"],
+                "SNO": [0, ""],
+                "BLDG_NM": ["서울숲 한신 더 휴", "서울숲(한신)더휴"],
+                "ARCH_AREA": [59.91, 84.95],
+            }
+        )
+        original = source.copy(deep=True)
+
+        identified = assign_complex_identity(assign_area_group(source))
+
+        self.assertEqual(identified["COMPLEX_ID"].nunique(), 1)
+        self.assertTrue(identified["COMPLEX_ID"].notna().all())
+        self.assertEqual(identified["AREA_GROUP"].tolist(), ["59㎡형", "84㎡형"])
+        for column in ["BLDG_NM", "MNO", "SNO", "ARCH_AREA"]:
+            self.assertTrue(identified[column].equals(original[column]))
+
+    def test_complex_name_normalization_preserves_roman_numerals(self):
+        first = normalize_complex_name("골드캐슬Ⅰ")
+        third = normalize_complex_name("골드캐슬Ⅲ")
+
+        self.assertEqual(first, "골드캐슬i")
+        self.assertEqual(third, "골드캐슬iii")
+        self.assertNotEqual(first, third)
+
+    def test_complex_identity_separates_regions_and_skips_missing_main_lot(self):
+        source = pd.DataFrame(
+            {
+                "CGG_CD": [11110, 11140, 11110],
+                "STDG_CD": [10100, 10100, 10100],
+                "LOTNO_SE": [1, 1, 1],
+                "MNO": [10, 10, pd.NA],
+                "SNO": [0, 0, 0],
+                "BLDG_NM": ["현대", "현대", "현대"],
+            }
+        )
+
+        identified = assign_complex_identity(source)
+
+        self.assertNotEqual(
+            identified.iloc[0]["COMPLEX_ID"], identified.iloc[1]["COMPLEX_ID"]
+        )
+        self.assertTrue(pd.isna(identified.iloc[2]["COMPLEX_ID"]))
 
     def test_single_snapshot_preserves_repeated_rows_and_cancellation(self):
         base = {
