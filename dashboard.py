@@ -20,10 +20,10 @@ from analysis import (
     build_price_change_metrics,
     build_trade_up_gap_comparison,
     build_watchlist_area_comparison,
-    build_watchlist_summary,
     determine_analysis_as_of_date,
     filter_area_group,
     filter_complex_transactions,
+    monthly_gap_observation_status,
     load_watchlist,
 )
 from data_pipeline import (
@@ -411,16 +411,23 @@ def render_price_volume_analysis(
         )
 
 
-st.sidebar.title("🛠️ 데이터 옵션")
-api_mode_label = f"저장 파일 + {CURRENT_RECEIPT_YEAR}년 접수연도 API"
-data_mode = st.sidebar.radio(
-    "데이터 모드",
-    ["저장 파일 우선 (권장)", api_mode_label],
-    help="API 모드는 명시적으로 선택했을 때만 현재 접수연도 전체 데이터를 가져옵니다.",
+st.sidebar.title("HomeAnalysis")
+page = st.sidebar.radio(
+    "화면",
+    ["① 요약", "② 단지 상세", "③ 동일 평형 비교", "④ 갈아타기 분석", "⑤ 시장 참고"],
+    key="page_navigation",
 )
-if st.sidebar.button("🔄 파일·캐시 새로고침"):
-    st.cache_data.clear()
-    st.rerun()
+
+api_mode_label = f"저장 파일 + {CURRENT_RECEIPT_YEAR}년 접수연도 API"
+with st.sidebar.expander("고급 데이터 설정"):
+    data_mode = st.radio(
+        "데이터 모드",
+        ["저장 파일 우선 (권장)", api_mode_label],
+        help="API 모드는 명시적으로 선택했을 때만 현재 접수연도 전체 데이터를 가져옵니다.",
+    )
+    if st.button("파일·캐시 새로고침"):
+        st.cache_data.clear()
+        st.rerun()
 
 file_signatures = data_file_signatures(BASE_DIR)
 with st.spinner("저장된 실거래 데이터를 불러오는 중입니다..."):
@@ -430,29 +437,25 @@ if data_mode == api_mode_label:
     if not API_KEY:
         st.sidebar.error("SEOUL_API_KEY가 없어 저장 파일만 표시합니다.")
     else:
-        with st.spinner(
-            f"{CURRENT_RECEIPT_YEAR}년 접수연도 API 전체 데이터를 가져오는 중입니다..."
-        ):
+        with st.spinner(f"{CURRENT_RECEIPT_YEAR}년 접수연도 API를 가져오는 중입니다..."):
             try:
                 api_raw = fetch_cached_api_data(API_KEY, CURRENT_RECEIPT_YEAR)
                 stored_raw = load_stored_raw_data(BASE_DIR)
                 combined_raw, snapshot_overlaps = combine_raw_data([stored_raw, api_raw])
                 prepared, quality = preprocess_data(
-                    combined_raw,
-                    analysis_start_date=ANALYSIS_START_DATE,
+                    combined_raw, analysis_start_date=ANALYSIS_START_DATE
                 )
                 df, cancellation_quality = build_effective_transactions(prepared)
-                df = assign_area_group(df)
-                df = assign_complex_identity(df)
+                df = assign_complex_identity(assign_area_group(df))
                 quality = {**quality, **cancellation_quality}
                 st.sidebar.success(
-                    f"{CURRENT_RECEIPT_YEAR}년 접수 API {len(api_raw):,}건 병합 · "
-                    f"스냅샷 겹침 {snapshot_overlaps:,}건 제외"
+                    f"API {len(api_raw):,}건 병합 · 겹침 {snapshot_overlaps:,}건 제외"
                 )
             except Exception as exc:
                 st.sidebar.error(f"API 수집 실패: {exc}")
 
-st.title("🏙️ 서울 부동산 실거래가 분석 대시보드")
+st.title("HomeAnalysis")
+st.caption("실거래 기반 주택 가격 흐름과 갈아타기 GAP 분석")
 if df.empty:
     st.error("표시할 실거래 데이터를 찾지 못했습니다.")
     st.stop()
@@ -465,440 +468,156 @@ if analysis_as_of_date is None:
     st.error("분석 기준 계약일을 결정할 수 없습니다.")
     st.stop()
 data_available_from = pd.Timestamp(df["CONTRACT_DATE"].min()).normalize()
+delay_days = max((pd.Timestamp(dt.date.today()) - analysis_as_of_date).days, 0)
 
-status_columns = st.columns(5)
-status_columns[0].metric("데이터 최초일", format_date(status["first_date"]))
-status_columns[1].metric("데이터 기준일", format_date(status["last_date"]))
-status_columns[2].metric("전체 거래건수", f"{status['total_count']:,}건")
-status_columns[3].metric(
-    f"{CURRENT_CONTRACT_YEAR}년 계약건수",
-    f"{status['contract_year_count']:,}건",
-)
-status_columns[4].metric("마지막 자동 업데이트", format_update_time(metadata))
+status_columns = st.columns(3)
+status_columns[0].metric("데이터 기준일", format_date(analysis_as_of_date))
+status_columns[1].metric("마지막 자동 업데이트", format_update_time(metadata))
+status_columns[2].metric("최신 계약 기준", f"{delay_days}일 전")
+st.caption("최신 계약일은 계약신고 시차의 영향을 받으며, 지연일 자체가 데이터 오류를 뜻하지 않습니다.")
 
-if quality["potential_repeated_rows"]:
+with st.sidebar.expander("데이터 품질 상세"):
+    st.metric("전체 유효 거래", f"{status['total_count']:,}건")
     st.caption(
-        f"동일 공개 속성 반복 {quality['potential_repeated_rows']:,}건은 "
-        "별도 호실 거래일 수 있어 보존했습니다."
+        f"취소행 {quality['cancellation_row_count']:,}건 · 대응 원거래 "
+        f"{quality['matched_original_count']:,}건 제외"
     )
-
-st.caption(
-    f"취소행 {quality['cancellation_row_count']:,}건과 대응 원거래 "
-    f"{quality['matched_original_count']:,}건을 분석에서 제외했습니다. "
-    f"미매칭 {quality['unmatched_cancellation_count']:,}건 · "
-    f"모호 {quality['ambiguous_cancellation_count']:,}건"
-)
-
-if status["missing_past_months"]:
-    missing_labels = ", ".join(
-        f"{CURRENT_CONTRACT_YEAR}년 {month}월"
-        for month in status["missing_past_months"]
+    st.caption(
+        f"미매칭 {quality['unmatched_cancellation_count']:,}건 · "
+        f"모호 {quality['ambiguous_cancellation_count']:,}건 · "
+        f"날짜 오류 {quality['invalid_dates']:,}건"
     )
-    st.warning(
-        f"⚠️ 이미 지난 월 중 데이터가 없는 기간: {missing_labels}. "
-        "GitHub Actions 실행 상태와 데이터 파일을 확인하세요."
-    )
-
-with st.sidebar.expander(
-    f"📋 {CURRENT_CONTRACT_YEAR}년 계약월별 데이터 상태", expanded=True
-):
+    st.caption(f"보존한 동일 공개속성 반복 {quality['potential_repeated_rows']:,}건")
     month_status = pd.DataFrame(
         {
-            "계약월": [
-                f"{CURRENT_CONTRACT_YEAR}-{month:02d}"
-                for month in status["month_counts"]
-            ],
+            "계약월": [f"{CURRENT_CONTRACT_YEAR}-{month:02d}" for month in status["month_counts"]],
             "거래건수": list(status["month_counts"].values()),
         }
     )
     st.dataframe(month_status, hide_index=True, width="stretch")
-    st.caption(f"전처리 중 제외된 날짜 오류: {quality['invalid_dates']:,}건")
 
-tabs = st.tabs(
-    [
-        "📊 10대 대단지 현황",
-        "🏠 태강아파트 (공릉동)",
-        "🔁 관심단지 비교",
-        "📋 Watchlist 전체 비교",
-        "↔️ 1:1 갈아타기 GAP",
-        "🧭 다중 후보 GAP",
-    ]
-)
+if status["missing_past_months"]:
+    missing_labels = ", ".join(
+        f"{CURRENT_CONTRACT_YEAR}-{month:02d}" for month in status["missing_past_months"]
+    )
+    st.warning(f"이미 지난 계약월 중 데이터가 없는 기간: {missing_labels}")
 
-mega_complexes_keywords = [
-    "헬리오시티",
-    "파크리오",
-    "잠실엘스",
-    "리센츠",
-    "고덕그라시움",
-    "고덕아르테온",
-    "올림픽선수기자촌",
-    "센트라스",
-    "마포래미안푸르지오",
-    "올림픽파크포레온",
-]
-mega_filtered = get_filtered_mega_data(df, mega_complexes_keywords)
-
-with tabs[0]:
-    st.header("서울 10대 대단지 주력 평형 분석")
-    st.caption("각 단지에서 거래가 가장 많은 대표 전용면적 데이터를 비교합니다.")
-    if mega_filtered.empty:
-        st.warning("분석할 10대 단지 데이터가 없습니다.")
-    else:
-        left, right = st.columns([1, 1])
-        with left:
-            st.subheader("📅 주력 평형별 최신 실거래")
-            recent = mega_filtered.sort_values("CTRT_DAY", ascending=False).head(50)
-            display_columns = ["CTRT_DAY", "GROUP_NM", "MAIN_AREA", "THING_AMT", "FLR"]
-            st.dataframe(
-                recent[display_columns].rename(
-                    columns={
-                        "CTRT_DAY": "계약일",
-                        "GROUP_NM": "단지명",
-                        "MAIN_AREA": "대표 면적그룹",
-                        "THING_AMT": "거래금액(억)",
-                        "FLR": "층",
-                    }
-                ),
-                width="stretch",
-                height=450,
-            )
-        with right:
-            st.subheader("📈 주력 평형 평균 가격 추이")
-            mega_trend = (
-                mega_filtered.groupby(
-                    ["CONTRACT_YEAR_MONTH", "GROUP_NM"], as_index=False
-                )[
-                    "THING_AMT"
-                ].mean()
-            )
-            figure = px.line(
-                mega_trend,
+if page == "① 요약":
+    st.header("전체 상황")
+    st.write(
+        "단지 상세에서 가격 흐름을 확인하고, 동일 평형 비교로 후보를 좁힌 뒤, "
+        "갈아타기 분석에서 기준 주택과 후보의 GAP 변화를 확인하세요."
+    )
+    overview = build_monthly_trend(df)
+    recent_overview = overview.tail(12)
+    left, right = st.columns(2)
+    with left:
+        st.subheader("최근 월별 거래량")
+        st.plotly_chart(
+            px.bar(
+                recent_overview,
                 x="CONTRACT_YEAR_MONTH",
-                y="THING_AMT",
-                color="GROUP_NM",
-                labels={
-                    "THING_AMT": "평균 거래금액(억)",
-                    "CONTRACT_YEAR_MONTH": "계약년월",
-                },
-                title="단지별 대표 평형 가격 변동",
-                markers=True,
-            )
-            st.plotly_chart(figure, width="stretch")
-
-        st.markdown("---")
-        st.subheader("🏢 단지별 대표 평형 요약")
-        mega_stats = (
-            mega_filtered.groupby(["GROUP_NM", "MAIN_AREA"], as_index=False)
-            .agg(
-                거래건수=("THING_AMT", "size"),
-                평균가_억=("THING_AMT", "mean"),
-                최고가_억=("THING_AMT", "max"),
-                최저가_억=("THING_AMT", "min"),
-            )
-            .rename(columns={"GROUP_NM": "단지명", "MAIN_AREA": "대표 면적그룹"})
+                y="거래건수",
+                labels={"CONTRACT_YEAR_MONTH": "계약연월"},
+            ),
+            width="stretch",
         )
+    with right:
+        st.subheader("최근 월별 중앙가격")
+        st.plotly_chart(
+            px.line(
+                recent_overview,
+                x="CONTRACT_YEAR_MONTH",
+                y="중앙값",
+                markers=True,
+                labels={"CONTRACT_YEAR_MONTH": "계약연월", "중앙값": "중앙가격(억)"},
+            ),
+            width="stretch",
+        )
+    st.info("가격 비교는 서로 다른 면적이 섞이지 않도록 단지 × 전용면적 그룹 화면을 이용하세요.")
+
+elif page == "② 단지 상세":
+    st.header("단지 상세")
+    selectors = st.columns(2)
+    selected_name = selectors[0].selectbox(
+        "단지", watchlist["display_name"].tolist(), key="detail_complex"
+    )
+    selected_config = watchlist[watchlist["display_name"].eq(selected_name)].iloc[0]
+    complex_transactions = filter_complex_transactions(df, selected_config)
+    area_summary = build_area_group_summary(complex_transactions)
+    area_options = area_summary["AREA_GROUP"].tolist()
+    default_area = "59㎡형" if selected_name == "태강아파트" and "59㎡형" in area_options else area_options[0]
+    selected_area = selectors[1].selectbox(
+        "전용면적 그룹",
+        area_options,
+        index=area_options.index(default_area),
+        key="detail_area",
+    )
+    selected_transactions = filter_area_group(complex_transactions, selected_area)
+    metrics = build_price_change_metrics(
+        selected_transactions,
+        analysis_as_of_date=analysis_as_of_date,
+        data_available_from=data_available_from,
+    )
+    current_3m = metrics["3M"]["current"]
+    top = st.columns(6)
+    top[0].metric("선택", f"{selected_name} · {selected_area}")
+    top[1].metric("최근 거래일", format_date(metrics["latest_contract_date"]))
+    top[2].metric("최근 실거래가", format_optional_money(metrics["latest_price"]))
+    top[3].metric("최근 3M 중앙값", format_optional_money(current_3m["median_price"]))
+    top[4].metric("3M 변화율", format_optional_pct(metrics["3M"]["price_change_pct"]))
+    top[5].metric("최근 3M 거래", f"{current_3m['transaction_count']}건 · {current_3m['sample_status']}")
+
+    with st.expander("3M · 6M · 12M 가격 상세", expanded=True):
+        render_period_change_metrics("3개월", metrics["3M"])
+        render_period_change_metrics("6개월", metrics["6M"])
+        twelve = metrics["12M"]["current"]
+        twelve_cols = st.columns(5)
+        twelve_cols[0].metric("12M 중앙값", format_optional_money(twelve["median_price"]))
+        twelve_cols[1].metric("12M 거래", f"{twelve['transaction_count']}건")
+        twelve_cols[2].metric("12M 최고가", format_optional_money(twelve["highest_price"]))
+        twelve_cols[3].metric("12M 최저가", format_optional_money(twelve["lowest_price"]))
+        twelve_cols[4].metric("고점 대비", format_optional_pct(metrics["12M"]["high_gap_pct"]))
+    with st.expander("월별 가격·거래량", expanded=True):
+        render_monthly_chart(
+            selected_transactions,
+            title_prefix=f"{selected_name} {selected_area}",
+            key_prefix="detail",
+        )
+    with st.expander("실거래 상세내역과 층별 분포"):
+        detail = selected_transactions.sort_values("CTRT_DAY", ascending=False)
         st.dataframe(
-            mega_stats.style.format(
-                {"평균가_억": "{:.2f}", "최고가_억": "{:.2f}", "최저가_억": "{:.2f}"}
+            detail[["CTRT_DAY", "THING_AMT", "ARCH_AREA", "FLR"]].rename(
+                columns={"CTRT_DAY": "계약일", "THING_AMT": "거래금액(억)", "ARCH_AREA": "전용면적(㎡)", "FLR": "층"}
             ),
             width="stretch",
             hide_index=True,
         )
-
-with tabs[1]:
-    st.header("노원구 공릉동 태강아파트 상세분석")
-    taegang_config = watchlist[watchlist["display_name"] == "태강아파트"].iloc[0]
-    taegang = filter_complex_transactions(df, taegang_config)
-
-    taegang_area_groups = build_area_group_summary(taegang)["AREA_GROUP"].tolist()
-    area_choice = st.radio("🏠 전용면적 그룹 선택", taegang_area_groups, horizontal=True)
-    selected_taegang = filter_area_group(taegang, area_choice)
-
-    if selected_taegang.empty:
-        st.warning(f"{area_choice}의 거래 내역이 선택한 데이터 범위에 없습니다.")
-    else:
-        st.info(f"📍 태강아파트 {area_choice} 분석 결과")
-        left, right = st.columns([1, 1])
-        with left:
-            st.subheader("📅 실거래 내역")
-            detail = selected_taegang.sort_values("CTRT_DAY", ascending=False)
-            st.dataframe(
-                detail[["CTRT_DAY", "THING_AMT", "ARCH_AREA", "FLR"]].rename(
-                    columns={
-                        "CTRT_DAY": "계약일",
-                        "THING_AMT": "거래금액(억)",
-                        "ARCH_AREA": "전용면적(㎡)",
-                        "FLR": "층",
-                    }
-                ),
-                width="stretch",
-                height=450,
-            )
-        with right:
-            st.subheader("📈 가격 추세")
-            render_monthly_chart(
-                selected_taegang,
-                title_prefix=f"태강 {area_choice}",
-                key_prefix="taegang",
-            )
-
-        st.markdown("---")
-        st.subheader("🔍 층별 거래 분포")
-        scatter = px.scatter(
-            selected_taegang,
-            x="CTRT_DAY",
-            y="THING_AMT",
-            color="FLR",
-            labels={"CTRT_DAY": "계약일", "THING_AMT": "거래금액(억)", "FLR": "층"},
-            hover_data=["ARCH_AREA"],
-            title=f"{area_choice} 거래 상세 분포",
-        )
-        st.plotly_chart(scatter, width="stretch")
-
-with tabs[2]:
-    st.header("관심단지 갈아타기 비교")
-    as_of = analysis_as_of_date
-    summary = build_watchlist_summary(df, watchlist, as_of)
-    reference = summary[summary["단지명"] == "태강아파트"].iloc[0]
-    candidates = summary[summary["단지명"] != "태강아파트"]
-    valid_gaps = pd.to_numeric(candidates["태강 대비 GAP"], errors="coerce").dropna()
-    gap_changes = pd.to_numeric(candidates["GAP 변화"], errors="coerce")
-
-    st.caption(f"데이터 기준일 {as_of.strftime('%Y-%m-%d')} · 가격 단위 억원")
-    metric_columns = st.columns(3)
-    metric_columns[0].metric(
-        "태강 기준가격",
-        f"{reference['기준가격']:.2f}억" if pd.notna(reference["기준가격"]) else "-",
-        help=str(reference["기준가격 유형"]),
-    )
-    metric_columns[1].metric(
-        "관심단지 평균 GAP",
-        f"{valid_gaps.mean():.2f}억" if not valid_gaps.empty else "-",
-    )
-    metric_columns[2].metric("GAP 축소 단지 수", f"{int((gap_changes < 0).sum())}곳")
-
-    st.subheader("관심단지 비교표")
-    comparison_columns = [
-        "단지명",
-        "최근 실거래가",
-        "최근 거래일",
-        "3개월 평균가",
-        "3개월 중앙값",
-        "6개월 평균가",
-        "6개월 중앙값",
-        "3개월 거래건수",
-        "6개월 거래건수",
-        "1년 최고가",
-        "1년 최저가",
-        "㎡당 거래가격",
-        "기준가격 유형",
-        "태강 대비 GAP",
-        "3개월 전 GAP",
-        "GAP 변화",
-        "GAP 방향",
-    ]
-    comparison = summary[comparison_columns].copy()
-    comparison["최근 거래일"] = comparison["최근 거래일"].map(format_date)
-    money_columns = [
-        "최근 실거래가",
-        "3개월 평균가",
-        "3개월 중앙값",
-        "6개월 평균가",
-        "6개월 중앙값",
-        "1년 최고가",
-        "1년 최저가",
-        "태강 대비 GAP",
-        "3개월 전 GAP",
-        "GAP 변화",
-    ]
-    st.dataframe(
-        comparison.style.format(
-            {**{column: "{:.2f}" for column in money_columns}, "㎡당 거래가격": "{:.3f}"},
-            na_rep="-",
-        ),
-        width="stretch",
-        hide_index=True,
-    )
-
-    st.subheader("태강 대비 현재 GAP")
-    gap_chart_data = candidates.dropna(subset=["태강 대비 GAP"]).copy()
-    if gap_chart_data.empty:
-        st.warning("GAP을 계산할 수 있는 관심단지 거래가 없습니다.")
-    else:
-        gap_figure = px.bar(
-            gap_chart_data,
-            x="단지명",
-            y="태강 대비 GAP",
-            color="GAP 변화",
-            color_continuous_scale="RdYlGn_r",
-            labels={"태강 대비 GAP": "태강 대비 GAP(억)", "GAP 변화": "3개월 대비 변화(억)"},
-            title="후보단지 기준가격 - 태강 기준가격",
-        )
-        st.plotly_chart(gap_figure, width="stretch")
-
-    st.subheader("단지별·전용면적 그룹 가격 추세")
-    selected_name = st.selectbox("관심단지 선택", watchlist["display_name"].tolist())
-    selected_config = watchlist[watchlist["display_name"] == selected_name].iloc[0]
-    complex_transactions = filter_complex_transactions(df, selected_config)
-    identity_columns = [
-        column
-        for column in [
-            "COMPLEX_ID",
-            "COMPLEX_NAME",
-            "BLDG_NM",
-            "CGG_NM",
-            "STDG_NM",
-            "MNO",
-            "SNO",
-        ]
-        if column in complex_transactions.columns
-    ]
-    with st.expander("단지 식별 정보"):
-        st.dataframe(
-            complex_transactions[identity_columns].drop_duplicates(),
+        st.plotly_chart(
+            px.scatter(
+                detail,
+                x="CTRT_DAY",
+                y="THING_AMT",
+                color="FLR",
+                hover_data=["ARCH_AREA"],
+                labels={"CTRT_DAY": "계약일", "THING_AMT": "거래금액(억)", "FLR": "층"},
+            ),
             width="stretch",
-            hide_index=True,
-        )
-    area_summary = build_area_group_summary(complex_transactions)
-    if not area_summary.empty:
-        area_overview = area_summary[
-            [
-                "AREA_GROUP",
-                "AREA_VALUES",
-                "TRANSACTION_COUNT",
-                "LATEST_CONTRACT_DATE",
-                "LATEST_PRICE",
-            ]
-        ].copy()
-        area_overview["AREA_VALUES"] = area_overview["AREA_VALUES"].map(
-            lambda values: ", ".join(f"{value:g}" for value in values)
-        )
-        st.dataframe(
-            area_overview.rename(
-                columns={
-                    "AREA_GROUP": "면적그룹",
-                    "AREA_VALUES": "원본 전용면적(㎡)",
-                    "TRANSACTION_COUNT": "거래건수",
-                    "LATEST_CONTRACT_DATE": "최근 거래일",
-                    "LATEST_PRICE": "최근 거래가(억)",
-                }
-            ).style.format({"최근 거래가(억)": "{:.2f}"}),
-            width="stretch",
-            hide_index=True,
-        )
-    area_options = ["전체", *area_summary["AREA_GROUP"].tolist()]
-    selected_area_group = st.selectbox(
-        "전용면적 그룹",
-        area_options,
-        key="watchlist_area_group",
-    )
-    selected_transactions = filter_area_group(
-        complex_transactions,
-        selected_area_group,
-    )
-    scope_label = (
-        selected_name
-        if selected_area_group == "전체"
-        else f"{selected_name} {selected_area_group}"
-    )
-    if not selected_transactions.empty:
-        latest = selected_transactions.sort_values(
-            "CTRT_DAY", kind="stable"
-        ).iloc[-1]
-        scope_metrics = st.columns(6)
-        scope_metrics[0].metric("거래건수", f"{len(selected_transactions):,}건")
-        scope_metrics[1].metric("최근 거래일", format_date(latest["CTRT_DAY"]))
-        scope_metrics[2].metric("최근 거래가", f"{latest['THING_AMT']:.2f}억")
-        scope_metrics[3].metric(
-            "평균가", f"{selected_transactions['THING_AMT'].mean():.2f}억"
-        )
-        scope_metrics[4].metric(
-            "중앙값", f"{selected_transactions['THING_AMT'].median():.2f}억"
-        )
-        scope_metrics[5].metric(
-            "최저~최고",
-            f"{selected_transactions['THING_AMT'].min():.2f}~"
-            f"{selected_transactions['THING_AMT'].max():.2f}억",
-        )
-    if selected_area_group == "전체":
-        st.info(
-            "가격 변화 분석은 서로 다른 면적이 섞이지 않도록 개별 전용면적 그룹을 "
-            "선택했을 때 제공됩니다. 전체 조회에서는 기존 월별 추세를 표시합니다."
-        )
-        render_monthly_chart(
-            selected_transactions,
-            title_prefix=scope_label,
-            key_prefix="watchlist",
-        )
-    elif selected_transactions.empty:
-        st.info(f"{scope_label}의 기간 분석 대상 거래가 없습니다.")
-    else:
-        render_price_volume_analysis(
-            selected_transactions,
-            analysis_as_of_date=analysis_as_of_date,
-            data_available_from=data_available_from,
-            scope_label=scope_label,
         )
 
-    st.subheader("상세 거래내역")
-    if selected_transactions.empty:
-        st.info(f"{selected_name}의 거래 데이터가 없습니다.")
-    else:
-        details = selected_transactions.sort_values("CTRT_DAY", ascending=False)[
-            [
-                "CTRT_DAY",
-                "COMPLEX_NAME",
-                "BLDG_NM",
-                "COMPLEX_ID",
-                "AREA_GROUP",
-                "THING_AMT",
-                "ARCH_AREA",
-                "FLR",
-                "CGG_NM",
-                "STDG_NM",
-            ]
-        ].rename(
-            columns={
-                "CTRT_DAY": "계약일",
-                "COMPLEX_NAME": "표준 단지명",
-                "BLDG_NM": "API 단지명",
-                "COMPLEX_ID": "단지 식별자",
-                "AREA_GROUP": "면적그룹",
-                "THING_AMT": "거래금액(억)",
-                "ARCH_AREA": "전용면적(㎡)",
-                "FLR": "층",
-                "CGG_NM": "자치구",
-                "STDG_NM": "법정동",
-            }
-        )
-        st.dataframe(details, width="stretch", hide_index=True)
-
-
-with tabs[3]:
-    st.header("Watchlist 단지 × 전용면적 그룹 전체 비교")
-    st.caption(
-        f"모든 단지 공통 분석 기준일 {analysis_as_of_date:%Y-%m-%d} · 가격 단위 억원 · "
-        "최근 거래 상태는 거래 시점 안내이며 통계 신뢰도 점수가 아닙니다."
-    )
-
+elif page == "③ 동일 평형 비교":
+    st.header("Watchlist 동일 평형 비교")
     watchlist_area_groups = set()
     for _, config in watchlist.iterrows():
-        watchlist_area_groups.update(
-            filter_complex_transactions(df, config)["AREA_GROUP"].dropna().tolist()
-        )
+        watchlist_area_groups.update(filter_complex_transactions(df, config)["AREA_GROUP"].dropna())
     area_group_options = sorted(
-        watchlist_area_groups,
-        key=lambda value: float(str(value).replace("㎡형", "")),
-    )
-    default_area_index = (
-        area_group_options.index("84㎡형") if "84㎡형" in area_group_options else 0
+        watchlist_area_groups, key=lambda value: float(str(value).replace("㎡형", ""))
     )
     selected_comparison_area = st.selectbox(
-        "공통 전용면적 그룹",
+        "비교 전용면적 그룹",
         area_group_options,
-        index=default_area_index,
-        key="watchlist_comparison_area",
+        index=area_group_options.index("84㎡형") if "84㎡형" in area_group_options else 0,
+        key="same_area_group",
     )
     comparison = build_watchlist_area_comparison(
         df,
@@ -907,523 +626,271 @@ with tabs[3]:
         analysis_as_of_date=analysis_as_of_date,
         data_available_from=data_available_from,
     )
-
     sort_labels = {
         "등록 순서": "WATCHLIST_ORDER",
         "최근 실거래가": "RECENT_PRICE",
         "3개월 변화율": "3M_CHANGE_PCT",
         "6개월 변화율": "6M_CHANGE_PCT",
-        "고점 대비 GAP": "HIGH_GAP_PCT",
         "최근 3개월 거래건수": "CURRENT_3M_COUNT",
         "최근 거래일": "RECENT_CONTRACT_DATE",
+        "고점 대비 수준": "HIGH_GAP_PCT",
     }
     controls = st.columns([2, 1])
-    sort_label = controls[0].selectbox(
-        "정렬 기준", list(sort_labels), key="watchlist_comparison_sort"
-    )
-    descending = controls[1].toggle(
-        "내림차순", value=sort_label != "등록 순서", key="watchlist_comparison_desc"
-    )
-    sort_column = sort_labels[sort_label]
+    sort_label = controls[0].selectbox("정렬 기준", list(sort_labels), key="same_area_sort")
+    descending = controls[1].toggle("내림차순", value=False, key="same_area_desc")
     ordered = comparison.sort_values(
-        sort_column,
-        ascending=not descending,
-        na_position="last",
-        kind="stable",
+        sort_labels[sort_label], ascending=not descending, na_position="last", kind="stable"
     )
-
-    display = ordered[
+    core = ordered[
         [
-            "WATCHLIST_NAME",
-            "AREA_GROUP",
-            "RECENT_CONTRACT_DATE",
-            "RECENT_PRICE",
-            "RECENT_TRADE_AGE_DAYS",
-            "RECENT_TRADE_STATUS",
-            "CURRENT_3M_MEDIAN",
-            "3M_CHANGE_PCT",
-            "CURRENT_3M_COUNT",
-            "3M_SAMPLE_STATUS",
-            "CURRENT_6M_MEDIAN",
-            "6M_CHANGE_PCT",
-            "CURRENT_6M_COUNT",
-            "CURRENT_12M_HIGH",
-            "HIGH_GAP_PCT",
+            "WATCHLIST_NAME", "AREA_GROUP", "RECENT_PRICE", "RECENT_CONTRACT_DATE",
+            "RECENT_TRADE_AGE_DAYS", "CURRENT_3M_MEDIAN", "3M_CHANGE_PCT",
+            "CURRENT_3M_COUNT", "3M_SAMPLE_STATUS", "6M_CHANGE_PCT", "HIGH_GAP_PCT",
         ]
-    ].rename(
-        columns={
-            "WATCHLIST_NAME": "단지명",
-            "AREA_GROUP": "면적그룹",
-            "RECENT_CONTRACT_DATE": "최근 거래일",
-            "RECENT_PRICE": "최근 실거래가",
-            "RECENT_TRADE_AGE_DAYS": "최근 거래 경과일",
-            "RECENT_TRADE_STATUS": "최근 거래 상태",
-            "CURRENT_3M_MEDIAN": "최근 3개월 중앙값",
-            "3M_CHANGE_PCT": "3개월 변화율(%)",
-            "CURRENT_3M_COUNT": "최근 3개월 거래건수",
-            "3M_SAMPLE_STATUS": "3개월 표본 상태",
-            "CURRENT_6M_MEDIAN": "최근 6개월 중앙값",
-            "6M_CHANGE_PCT": "6개월 변화율(%)",
-            "CURRENT_6M_COUNT": "최근 6개월 거래건수",
-            "CURRENT_12M_HIGH": "최근 12개월 최고가",
-            "HIGH_GAP_PCT": "고점 대비 GAP(%)",
-        }
-    )
+    ]
     st.dataframe(
-        display.style.format(
-            {
-                "최근 거래일": lambda value: format_date(value),
-                "최근 실거래가": "{:.2f}",
-                "최근 3개월 중앙값": "{:.2f}",
-                "3개월 변화율(%)": "{:+.1f}",
-                "최근 6개월 중앙값": "{:.2f}",
-                "6개월 변화율(%)": "{:+.1f}",
-                "최근 12개월 최고가": "{:.2f}",
-                "고점 대비 GAP(%)": "{:+.1f}",
-            },
-            na_rep="-",
-        ),
+        core,
         width="stretch",
         hide_index=True,
+        column_config={
+            "WATCHLIST_NAME": "단지명", "AREA_GROUP": "평형",
+            "RECENT_PRICE": st.column_config.NumberColumn("최근 실거래가", format="%.2f억"),
+            "RECENT_CONTRACT_DATE": st.column_config.DateColumn("최근 거래일", format="YYYY-MM-DD"),
+            "RECENT_TRADE_AGE_DAYS": "경과일", "CURRENT_3M_MEDIAN": st.column_config.NumberColumn("3M 중앙값", format="%.2f억"),
+            "3M_CHANGE_PCT": st.column_config.NumberColumn("3M 변화율", format="%+.1f%%"),
+            "CURRENT_3M_COUNT": "3M 거래", "3M_SAMPLE_STATUS": "표본 상태",
+            "6M_CHANGE_PCT": st.column_config.NumberColumn("6M 변화율", format="%+.1f%%"),
+            "HIGH_GAP_PCT": st.column_config.NumberColumn("고점 대비", format="%+.1f%%"),
+        },
     )
-    with st.expander("3·6·12개월 상세 비교 항목"):
-        detail_columns = [
-            "WATCHLIST_NAME", "AREA_GROUP",
-            "CURRENT_3M_MEDIAN", "PREVIOUS_3M_MEDIAN",
-            "3M_CHANGE_AMOUNT", "3M_CHANGE_PCT",
-            "CURRENT_3M_COUNT", "PREVIOUS_3M_COUNT",
-            "3M_VOLUME_CHANGE", "3M_SAMPLE_STATUS",
-            "CURRENT_6M_MEDIAN", "PREVIOUS_6M_MEDIAN",
-            "6M_CHANGE_AMOUNT", "6M_CHANGE_PCT",
-            "CURRENT_6M_COUNT", "PREVIOUS_6M_COUNT",
-            "6M_VOLUME_CHANGE", "6M_SAMPLE_STATUS",
-            "CURRENT_12M_MEDIAN", "CURRENT_12M_COUNT",
-            "CURRENT_12M_HIGH", "CURRENT_12M_LOW",
-            "HIGH_GAP_AMOUNT", "HIGH_GAP_PCT", "12M_CHANGE_PCT",
-        ]
-        st.dataframe(
-            ordered[detail_columns],
-            width="stretch",
-            hide_index=True,
-            column_config={
-                "WATCHLIST_NAME": "단지명",
-                "AREA_GROUP": "면적그룹",
-                "12M_CHANGE_PCT": st.column_config.NumberColumn(
-                    "직전 12개월 대비(%)", format="%.1f"
-                ),
-            },
-        )
+    with st.expander("3·6·12개월 상세 비교"):
+        st.dataframe(ordered, width="stretch", hide_index=True)
     missing_count = int((~comparison["AREA_AVAILABLE"]).sum())
     if missing_count:
-        st.info(
-            f"{selected_comparison_area}이 없는 {missing_count}개 단지는 다른 면적으로 "
-            "대체하지 않고 '해당 평형 없음'으로 표시했습니다."
-        )
+        st.info(f"{missing_count}개 단지는 {selected_comparison_area}이 없어 '해당 평형 없음'으로 유지했습니다.")
 
+elif page == "④ 갈아타기 분석":
+    st.header("갈아타기 분석")
+    mode = st.radio("비교 방식", ["1:1 비교", "여러 후보 비교"], horizontal=True, key="trade_mode")
 
-with tabs[4]:
-    st.header("기준 주택 vs 후보 주택 1:1 갈아타기 GAP")
-    st.caption(
-        f"공통 분석 기준일 {analysis_as_of_date:%Y-%m-%d} · 대표가격은 거래금액 중앙값 · "
-        "GAP은 후보 가격에서 기준 가격을 뺀 값입니다."
-    )
-
-    selector_columns = st.columns(2)
-    with selector_columns[0]:
-        st.markdown("#### 기준 주택")
-        base_name = st.selectbox(
-            "기준 단지",
-            watchlist["display_name"].tolist(),
-            index=0,
-            key="trade_up_base_complex",
-        )
-        base_config = watchlist[watchlist["display_name"].eq(base_name)].iloc[0]
-        base_complex = filter_complex_transactions(df, base_config)
-        base_area_options = build_area_group_summary(base_complex)["AREA_GROUP"].tolist()
-        base_area_index = base_area_options.index("59㎡형") if "59㎡형" in base_area_options else 0
-        base_area = st.selectbox(
-            "기준 평형",
-            base_area_options,
-            index=base_area_index,
-            key="trade_up_base_area",
-        )
-    with selector_columns[1]:
-        st.markdown("#### 후보 주택")
-        candidate_default = (
-            watchlist["display_name"].tolist().index("연희대우")
-            if "연희대우" in watchlist["display_name"].tolist()
-            else min(1, len(watchlist) - 1)
-        )
-        candidate_name = st.selectbox(
-            "후보 단지",
-            watchlist["display_name"].tolist(),
-            index=candidate_default,
-            key="trade_up_candidate_complex",
-        )
-        candidate_config = watchlist[
-            watchlist["display_name"].eq(candidate_name)
-        ].iloc[0]
-        candidate_complex = filter_complex_transactions(df, candidate_config)
-        candidate_area_options = build_area_group_summary(candidate_complex)[
-            "AREA_GROUP"
-        ].tolist()
-        candidate_area_index = (
-            candidate_area_options.index("84㎡형")
-            if "84㎡형" in candidate_area_options
-            else 0
-        )
-        candidate_area = st.selectbox(
-            "후보 평형",
-            candidate_area_options,
-            index=candidate_area_index,
-            key="trade_up_candidate_area",
-        )
-
-    base_scope = filter_area_group(base_complex, base_area)
-    candidate_scope = filter_area_group(candidate_complex, candidate_area)
-    gap_result = build_trade_up_gap_comparison(
-        base_scope,
-        candidate_scope,
-        analysis_as_of_date=analysis_as_of_date,
-        data_available_from=data_available_from,
-    )
-    base_metrics = gap_result["base"]["price_metrics"]
-    candidate_metrics = gap_result["candidate"]["price_metrics"]
-
-    st.markdown(f"### {base_name} {base_area} → {candidate_name} {candidate_area}")
-    latest_rows = []
-    for label, name, area, home in [
-        ("기준", base_name, base_area, gap_result["base"]),
-        ("후보", candidate_name, candidate_area, gap_result["candidate"]),
-    ]:
-        latest_rows.append(
-            {
-                "구분": label,
-                "단지": name,
-                "평형": area,
-                "최근 거래일": home["latest_contract_date"],
-                "최근 실거래가(억)": home["latest_price"],
-                "경과일": home["recent_trade_age_days"],
-                "최근 거래 상태": home["recent_trade_status"],
-            }
-        )
-    st.dataframe(
-        pd.DataFrame(latest_rows).style.format(
-            {"최근 거래일": lambda value: format_date(value), "최근 실거래가(억)": "{:.2f}"},
-            na_rep="-",
-        ),
-        width="stretch",
-        hide_index=True,
-    )
-
-    for months in (3, 6):
-        gap = gap_result[f"{months}M"]
-        base_period = base_metrics[f"{months}M"]
-        candidate_period = candidate_metrics[f"{months}M"]
-        st.markdown(f"#### {months}개월 GAP 변화")
-        gap_columns = st.columns(5)
-        gap_columns[0].metric(
-            "현재 GAP", format_gap_money(gap["current_gap"], signed=True)
-        )
-        gap_columns[1].metric(
-            "직전 GAP", format_gap_money(gap["previous_gap"], signed=True)
-        )
-        gap_columns[2].metric(
-            "GAP 변화", format_gap_money(gap["gap_change"], signed=True)
-        )
-        gap_columns[3].metric("GAP 변화율", format_gap_pct(gap["gap_change_pct"]))
-        gap_columns[4].metric("변화 방향", gap["gap_change_status"])
-        st.caption(
-            f"기준 최근 {base_period['current']['transaction_count']}건 · "
-            f"{base_period['current']['sample_status']} / "
-            f"후보 최근 {candidate_period['current']['transaction_count']}건 · "
-            f"{candidate_period['current']['sample_status']}"
-        )
-        if (
-            base_period["current"]["sample_status"] != "일반"
-            or candidate_period["current"]["sample_status"] != "일반"
-        ):
-            st.warning(
-                f"{months}개월 GAP에 거래 없음 또는 표본 적음 구간이 있습니다. "
-                "GAP 숫자와 표본 상태를 함께 확인하세요."
+    if mode == "1:1 비교":
+        selectors = st.columns(2)
+        with selectors[0]:
+            base_name = st.selectbox("기준 단지", watchlist["display_name"].tolist(), key="v2_base_complex")
+            base_config = watchlist[watchlist["display_name"].eq(base_name)].iloc[0]
+            base_complex = filter_complex_transactions(df, base_config)
+            base_areas = build_area_group_summary(base_complex)["AREA_GROUP"].tolist()
+            base_default = "59㎡형" if "59㎡형" in base_areas else base_areas[0]
+            base_area = st.selectbox("기준 평형", base_areas, index=base_areas.index(base_default), key="v2_base_area")
+        with selectors[1]:
+            candidate_default = watchlist["display_name"].tolist().index("연희대우")
+            candidate_name = st.selectbox(
+                "후보 단지", watchlist["display_name"].tolist(), index=candidate_default, key="v2_candidate_complex"
             )
-
-    detail_rows = []
-    for label, period_key, section, gap_key, price_key in [
-        ("최근 3M 중앙값", "3M", "current", "current_gap", "median_price"),
-        ("직전 3M 중앙값", "3M", "previous", "previous_gap", "median_price"),
-        ("최근 6M 중앙값", "6M", "current", "current_gap", "median_price"),
-        ("직전 6M 중앙값", "6M", "previous", "previous_gap", "median_price"),
-        ("최근 12M 중앙값", "12M", "current", "current_gap", "median_price"),
-        ("최근 12M 최고가", "12M", "current", "highest_price_gap", "highest_price"),
-        ("최근 12M 최저가", "12M", "current", "lowest_price_gap", "lowest_price"),
-    ]:
-        base_price = base_metrics[period_key][section][price_key]
-        candidate_price = candidate_metrics[period_key][section][price_key]
-        detail_rows.append(
-            {
-                "구분": label,
-                "기준 가격(억)": base_price,
-                "후보 가격(억)": candidate_price,
-                "가격 GAP(억)": gap_result[period_key][gap_key],
-            }
-        )
-    st.markdown("#### 가격 비교 상세")
-    st.dataframe(
-        pd.DataFrame(detail_rows).style.format(
-            {"기준 가격(억)": "{:.2f}", "후보 가격(억)": "{:.2f}", "가격 GAP(억)": "{:+.2f}"},
-            na_rep="N/A",
-        ),
-        width="stretch",
-        hide_index=True,
-    )
-
-    trend_start = (analysis_as_of_date.to_period("M") - 11).start_time.normalize()
-    monthly_gap = build_monthly_gap_trend(
-        base_scope,
-        candidate_scope,
-        start_date=trend_start,
-        end_date=analysis_as_of_date,
-    )
-    observed_gap = monthly_gap.dropna(subset=["MONTHLY_GAP"])
-    st.markdown("#### 월별 GAP 추세")
-    st.caption("양쪽 단지에 같은 계약월의 중앙값이 모두 있을 때만 GAP을 표시합니다.")
-    if observed_gap.empty:
-        st.info("같은 달에 양쪽 거래가 모두 존재한 월이 없습니다.")
-    else:
-        gap_figure = px.line(
-            observed_gap,
-            x="CONTRACT_YEAR_MONTH",
-            y="MONTHLY_GAP",
-            markers=True,
-            labels={"CONTRACT_YEAR_MONTH": "계약연월", "MONTHLY_GAP": "월별 GAP(억)"},
-            title="후보 월 중앙값 - 기준 월 중앙값",
-        )
-        st.plotly_chart(gap_figure, width="stretch")
-
-
-with tabs[5]:
-    st.header("기준 주택 1개 vs 여러 후보 GAP 비교")
-    st.caption(
-        f"공통 분석 기준일 {analysis_as_of_date:%Y-%m-%d} · 후보별 평형은 이번 화면에서만 "
-        "선택하며 자동 추천이나 순위를 제공하지 않습니다."
-    )
-
-    reference_columns = st.columns(2)
-    with reference_columns[0]:
-        multi_base_name = st.selectbox(
-            "기준 단지",
-            watchlist["display_name"].tolist(),
-            index=0,
-            key="multi_gap_base_complex",
-        )
-        multi_base_config = watchlist[
-            watchlist["display_name"].eq(multi_base_name)
-        ].iloc[0]
-        multi_base_complex = filter_complex_transactions(df, multi_base_config)
-    with reference_columns[1]:
-        multi_base_area_options = build_area_group_summary(multi_base_complex)[
-            "AREA_GROUP"
-        ].tolist()
-        multi_base_area_index = (
-            multi_base_area_options.index("59㎡형")
-            if "59㎡형" in multi_base_area_options
-            else 0
-        )
-        multi_base_area = st.selectbox(
-            "기준 평형",
-            multi_base_area_options,
-            index=multi_base_area_index,
-            key="multi_gap_base_area",
-        )
-    multi_base_scope = filter_area_group(multi_base_complex, multi_base_area)
-    multi_base_metrics = build_price_change_metrics(
-        multi_base_scope,
-        analysis_as_of_date=analysis_as_of_date,
-        data_available_from=data_available_from,
-    )
-    base_3m = multi_base_metrics["3M"]
-    base_latest_age = int(
-        (analysis_as_of_date - multi_base_metrics["latest_contract_date"]).days
-    )
-    st.markdown(f"### 기준: {multi_base_name} / {multi_base_area}")
-    base_summary_columns = st.columns(5)
-    base_summary_columns[0].metric(
-        "최근 3M 중앙값",
-        format_optional_money(base_3m["current"]["median_price"]),
-    )
-    base_summary_columns[1].metric(
-        "직전 3M 중앙값",
-        format_optional_money(base_3m["previous"]["median_price"]),
-    )
-    base_summary_columns[2].metric(
-        "최근 3M 가격 변화",
-        format_optional_pct(base_3m["price_change_pct"]),
-    )
-    base_summary_columns[3].metric(
-        "최근 3M 거래",
-        f"{base_3m['current']['transaction_count']}건 · {base_3m['current']['sample_status']}",
-    )
-    base_summary_columns[4].metric(
-        "최근 거래",
-        f"{format_date(multi_base_metrics['latest_contract_date'])}",
-        delta=f"{base_latest_age}일 전",
-        delta_color="off",
-    )
-
-    candidate_names = [
-        name
-        for name in watchlist["display_name"].tolist()
-        if name != multi_base_name
-    ]
-    selected_candidate_names = st.multiselect(
-        "비교 후보",
-        candidate_names,
-        default=candidate_names,
-        key="multi_gap_candidates",
-    )
-    candidate_specs = []
-    if selected_candidate_names:
-        st.markdown("#### 후보별 비교 평형")
-        area_columns = st.columns(3)
-        for position, candidate_name in enumerate(selected_candidate_names):
-            candidate_config = watchlist[
-                watchlist["display_name"].eq(candidate_name)
-            ].iloc[0]
+            candidate_config = watchlist[watchlist["display_name"].eq(candidate_name)].iloc[0]
             candidate_complex = filter_complex_transactions(df, candidate_config)
-            area_options = build_area_group_summary(candidate_complex)[
-                "AREA_GROUP"
-            ].tolist()
-            preferred_area = (
-                "112㎡형"
-                if candidate_name == "한진해모로" and "112㎡형" in area_options
-                else "84㎡형" if "84㎡형" in area_options else area_options[0]
+            candidate_areas = build_area_group_summary(candidate_complex)["AREA_GROUP"].tolist()
+            candidate_default_area = "84㎡형" if "84㎡형" in candidate_areas else candidate_areas[0]
+            candidate_area = st.selectbox(
+                "후보 평형", candidate_areas, index=candidate_areas.index(candidate_default_area), key="v2_candidate_area"
             )
-            with area_columns[position % len(area_columns)]:
-                candidate_area = st.selectbox(
-                    candidate_name,
-                    area_options,
-                    index=area_options.index(preferred_area),
-                    key=f"multi_gap_area_{candidate_name}",
-                )
-            candidate_specs.append(
-                {
-                    "name": candidate_name,
-                    "area_group": candidate_area,
-                    "watchlist_order": int(
-                        watchlist.index[
-                            watchlist["display_name"].eq(candidate_name)
-                        ][0]
-                    ),
-                    "transactions": filter_area_group(
-                        candidate_complex, candidate_area
-                    ),
-                }
-            )
-
-    if not candidate_specs:
-        st.info("비교할 후보 단지를 한 곳 이상 선택하세요.")
-    else:
-        multi_comparison = build_multi_candidate_gap_comparison(
-            multi_base_scope,
-            candidate_specs,
-            reference_name=multi_base_name,
-            reference_area_group=multi_base_area,
+        base_scope = filter_area_group(base_complex, base_area)
+        candidate_scope = filter_area_group(candidate_complex, candidate_area)
+        result = build_trade_up_gap_comparison(
+            base_scope,
+            candidate_scope,
             analysis_as_of_date=analysis_as_of_date,
             data_available_from=data_available_from,
         )
-        control_columns = st.columns([2, 1, 1])
-        multi_sort_options = {
-            "등록 순서": "WATCHLIST_ORDER",
-            "현재 3M GAP": "CURRENT_3M_GAP",
-            "3M GAP 변화금액": "GAP_CHANGE_3M",
-            "3M GAP 변화율": "GAP_CHANGE_PCT_3M",
-            "현재 6M GAP": "CURRENT_6M_GAP",
-            "6M GAP 변화금액": "GAP_CHANGE_6M",
-            "최근 3M 가격 변화율": "CANDIDATE_3M_PRICE_CHANGE_PCT",
-            "최근 3M 거래건수": "CANDIDATE_3M_COUNT",
-            "최근 거래일": "CANDIDATE_RECENT_TRADE_DATE",
-            "고점 대비 수준": "CANDIDATE_HIGH_GAP_PCT",
-        }
-        multi_sort_label = control_columns[0].selectbox(
-            "정렬 기준",
-            list(multi_sort_options),
-            key="multi_gap_sort",
-        )
-        multi_descending = control_columns[1].toggle(
-            "내림차순",
-            value=multi_sort_label != "등록 순서",
-            key="multi_gap_descending",
-        )
-        status_filter = control_columns[2].selectbox(
-            "3M GAP 상태",
-            ["전체", "축소", "확대", "변화 없음", "비교불가"],
-            key="multi_gap_status_filter",
-        )
-        filtered_multi = multi_comparison.copy()
-        if status_filter != "전체":
-            filtered_multi = filtered_multi[
-                filtered_multi["GAP_STATUS_3M"].eq(status_filter)
-            ]
-        filtered_multi = filtered_multi.sort_values(
-            multi_sort_options[multi_sort_label],
-            ascending=not multi_descending,
-            na_position="last",
-            kind="stable",
-        )
-        core_columns = [
-            "CANDIDATE_COMPLEX",
-            "CANDIDATE_AREA_GROUP",
-            "CURRENT_3M_GAP",
-            "PREVIOUS_3M_GAP",
-            "GAP_CHANGE_3M",
-            "GAP_CHANGE_PCT_3M",
-            "GAP_STATUS_3M",
-            "CURRENT_6M_GAP",
-            "GAP_CHANGE_6M",
-            "CANDIDATE_3M_MEDIAN",
-            "CANDIDATE_3M_COUNT",
-            "CANDIDATE_3M_SAMPLE_STATUS",
-            "CANDIDATE_RECENT_TRADE_DATE",
-            "CANDIDATE_RECENT_TRADE_AGE",
-            "CANDIDATE_RECENT_TRADE_STATUS",
-        ]
-        st.markdown("#### 후보 전체 비교표")
-        st.dataframe(
-            filtered_multi[core_columns],
-            width="stretch",
-            hide_index=True,
-            column_config={
-                "CANDIDATE_COMPLEX": "후보 단지",
-                "CANDIDATE_AREA_GROUP": "평형",
-                "CURRENT_3M_GAP": st.column_config.NumberColumn("현재 3M GAP", format="%.2f억"),
-                "PREVIOUS_3M_GAP": st.column_config.NumberColumn("직전 3M GAP", format="%.2f억"),
-                "GAP_CHANGE_3M": st.column_config.NumberColumn("3M GAP 변화", format="%+.2f억"),
-                "GAP_CHANGE_PCT_3M": st.column_config.NumberColumn("3M GAP 변화율", format="%+.1f%%"),
-                "GAP_STATUS_3M": "상태",
-                "CURRENT_6M_GAP": st.column_config.NumberColumn("현재 6M GAP", format="%.2f억"),
-                "GAP_CHANGE_6M": st.column_config.NumberColumn("6M GAP 변화", format="%+.2f억"),
-                "CANDIDATE_3M_MEDIAN": st.column_config.NumberColumn("후보 3M 중앙값", format="%.2f억"),
-                "CANDIDATE_3M_COUNT": "후보 3M 거래",
-                "CANDIDATE_3M_SAMPLE_STATUS": "표본 상태",
-                "CANDIDATE_RECENT_TRADE_DATE": st.column_config.DateColumn("최근 거래일", format="YYYY-MM-DD"),
-                "CANDIDATE_RECENT_TRADE_AGE": "경과일",
-                "CANDIDATE_RECENT_TRADE_STATUS": "최신성",
-            },
-        )
-        with st.expander("후보 가격·거래량 상세 지표"):
-            st.dataframe(
-                filtered_multi,
-                width="stretch",
-                hide_index=True,
-            )
+        st.subheader(f"{base_name} {base_area} → {candidate_name} {candidate_area}")
+        kpis = st.columns(8)
+        kpis[0].metric("현재 3M GAP", format_gap_money(result["3M"]["current_gap"], signed=True))
+        kpis[1].metric("3M 변화", format_gap_money(result["3M"]["gap_change"], signed=True))
+        kpis[2].metric("3M 상태", result["3M"]["gap_change_status"])
+        kpis[3].metric("현재 6M GAP", format_gap_money(result["6M"]["current_gap"], signed=True))
+        kpis[4].metric("6M 변화", format_gap_money(result["6M"]["gap_change"], signed=True))
+        kpis[5].metric("6M 상태", result["6M"]["gap_change_status"])
+        kpis[6].metric("가격 프리미엄", format_gap_pct(result["price_premium_pct"]))
+        kpis[7].metric("GAP 지속성", result["gap_persistence_status"])
+        st.caption("가격 프리미엄과 GAP 지속성은 상대 가격과 변화 방향을 보여주는 관찰 지표이며 추천점수가 아닙니다.")
 
-st.sidebar.markdown("---")
-st.sidebar.info(
-    """
-**데이터 갱신 안내**
-- 기본 모드는 저장된 CSV만 읽습니다.
-- GitHub Actions가 하루 1회 현재 접수연도 파일을 갱신합니다.
-- API 모드는 필요할 때만 명시적으로 선택하세요.
-"""
-)
+        base_metrics = result["base"]["price_metrics"]
+        candidate_metrics = result["candidate"]["price_metrics"]
+        with st.expander("직전 GAP · 변화율 · 표본 · 최근 거래 상세", expanded=True):
+            rows = []
+            for label, name, area, home in [
+                ("기준", base_name, base_area, result["base"]),
+                ("후보", candidate_name, candidate_area, result["candidate"]),
+            ]:
+                current = home["price_metrics"]["3M"]["current"]
+                rows.append(
+                    {
+                        "구분": label, "단지·평형": f"{name} · {area}",
+                        "최근 거래": f"{format_date(home['latest_contract_date'])} · {home['recent_trade_age_days']}일 전 · {home['recent_trade_status']}",
+                        "최근 실거래가": home["latest_price"], "3M 거래": current["transaction_count"],
+                        "표본 상태": current["sample_status"],
+                    }
+                )
+            st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+            detail_rows = []
+            for label, period, section, gap_key in [
+                ("최근 3M", "3M", "current", "current_gap"), ("직전 3M", "3M", "previous", "previous_gap"),
+                ("최근 6M", "6M", "current", "current_gap"), ("직전 6M", "6M", "previous", "previous_gap"),
+            ]:
+                detail_rows.append(
+                    {
+                        "기간": label, "기준 중앙값": base_metrics[period][section]["median_price"],
+                        "후보 중앙값": candidate_metrics[period][section]["median_price"],
+                        "GAP": result[period][gap_key],
+                    }
+                )
+            st.dataframe(pd.DataFrame(detail_rows), width="stretch", hide_index=True)
+
+        trend_start = (analysis_as_of_date.to_period("M") - 11).start_time.normalize()
+        monthly_gap = build_monthly_gap_trend(
+            base_scope, candidate_scope, start_date=trend_start, end_date=analysis_as_of_date
+        )
+        observed_gap = monthly_gap.dropna(subset=["MONTHLY_GAP"])
+        observed_count = int(len(observed_gap))
+        with st.expander("월별 GAP 추세", expanded=True):
+            st.caption(
+                f"월별 GAP 관측 {observed_count} / 12개월 · "
+                f"{monthly_gap_observation_status(observed_count)} · 실제 양쪽 거래가 있는 월만 표시"
+            )
+            if observed_gap.empty:
+                st.info("같은 달에 양쪽 거래가 모두 존재한 월이 없습니다.")
+            else:
+                gap_figure = px.line(
+                    observed_gap,
+                    x="CONTRACT_YEAR_MONTH", y="MONTHLY_GAP", markers=True,
+                    custom_data=["BASE_MEDIAN_PRICE", "CANDIDATE_MEDIAN_PRICE"],
+                    labels={"CONTRACT_YEAR_MONTH": "계약연월", "MONTHLY_GAP": "월별 GAP(억)"},
+                )
+                gap_figure.update_traces(
+                    hovertemplate="%{x}<br>기준 %{customdata[0]:.2f}억<br>후보 %{customdata[1]:.2f}억<br>GAP %{y:.2f}억<extra></extra>"
+                )
+                gap_figure.add_hline(y=0, line_dash="dot", line_color="gray")
+                st.plotly_chart(gap_figure, width="stretch")
+
+    else:
+        ref_cols = st.columns(2)
+        multi_base_name = ref_cols[0].selectbox("기준 단지", watchlist["display_name"].tolist(), key="v2_multi_base")
+        multi_base_config = watchlist[watchlist["display_name"].eq(multi_base_name)].iloc[0]
+        multi_base_complex = filter_complex_transactions(df, multi_base_config)
+        multi_base_areas = build_area_group_summary(multi_base_complex)["AREA_GROUP"].tolist()
+        multi_default = "59㎡형" if "59㎡형" in multi_base_areas else multi_base_areas[0]
+        multi_base_area = ref_cols[1].selectbox(
+            "기준 평형", multi_base_areas, index=multi_base_areas.index(multi_default), key="v2_multi_base_area"
+        )
+        multi_base_scope = filter_area_group(multi_base_complex, multi_base_area)
+        multi_base_metrics = build_price_change_metrics(
+            multi_base_scope, analysis_as_of_date=analysis_as_of_date, data_available_from=data_available_from
+        )
+        base_3m = multi_base_metrics["3M"]
+        summary_cols = st.columns(4)
+        summary_cols[0].metric("기준", f"{multi_base_name} · {multi_base_area}")
+        summary_cols[1].metric("3M 중앙값", format_optional_money(base_3m["current"]["median_price"]))
+        summary_cols[2].metric("3M 변화", format_optional_pct(base_3m["price_change_pct"]))
+        summary_cols[3].metric("3M 거래", f"{base_3m['current']['transaction_count']}건 · {base_3m['current']['sample_status']}")
+        candidate_names = [name for name in watchlist["display_name"] if name != multi_base_name]
+        selected_candidates = st.multiselect(
+            "비교 후보", candidate_names, default=candidate_names, key="v2_multi_candidates"
+        )
+        candidate_specs = []
+        with st.expander("후보별 목표 평형 설정"):
+            area_columns = st.columns(3)
+            for position, candidate_name in enumerate(selected_candidates):
+                config = watchlist[watchlist["display_name"].eq(candidate_name)].iloc[0]
+                transactions = filter_complex_transactions(df, config)
+                options = build_area_group_summary(transactions)["AREA_GROUP"].tolist()
+                preferred = "112㎡형" if candidate_name == "한진해모로" and "112㎡형" in options else "84㎡형" if "84㎡형" in options else options[0]
+                with area_columns[position % 3]:
+                    area = st.selectbox(
+                        candidate_name, options, index=options.index(preferred), key=f"v2_multi_area_{candidate_name}"
+                    )
+                candidate_specs.append(
+                    {
+                        "name": candidate_name, "area_group": area,
+                        "watchlist_order": int(watchlist.index[watchlist["display_name"].eq(candidate_name)][0]),
+                        "transactions": filter_area_group(transactions, area),
+                    }
+                )
+        if not candidate_specs:
+            st.info("비교할 후보를 한 곳 이상 선택하세요.")
+        else:
+            comparison = build_multi_candidate_gap_comparison(
+                multi_base_scope, candidate_specs,
+                reference_name=multi_base_name, reference_area_group=multi_base_area,
+                analysis_as_of_date=analysis_as_of_date, data_available_from=data_available_from,
+            )
+            sort_options = {
+                "등록 순서": "WATCHLIST_ORDER", "현재 3M GAP": "CURRENT_3M_GAP",
+                "3M GAP 변화": "GAP_CHANGE_3M", "가격 프리미엄": "PRICE_PREMIUM_PCT",
+                "현재 6M GAP": "CURRENT_6M_GAP", "최근 3M 거래건수": "CANDIDATE_3M_COUNT",
+                "최근 거래일": "CANDIDATE_RECENT_TRADE_DATE", "고점 대비 수준": "CANDIDATE_HIGH_GAP_PCT",
+            }
+            controls = st.columns([2, 1, 1])
+            sort_label = controls[0].selectbox("정렬 기준", list(sort_options), key="v2_multi_sort")
+            descending = controls[1].toggle("내림차순", key="v2_multi_desc")
+            gap_filter = controls[2].selectbox(
+                "3M 상태", ["전체", "축소", "확대", "변화 없음", "비교불가"], key="v2_multi_filter"
+            )
+            filtered = comparison if gap_filter == "전체" else comparison[comparison["GAP_STATUS_3M"].eq(gap_filter)]
+            filtered = filtered.sort_values(
+                sort_options[sort_label], ascending=not descending, na_position="last", kind="stable"
+            )
+            core_columns = [
+                "CANDIDATE_COMPLEX", "CANDIDATE_AREA_GROUP", "CURRENT_3M_GAP", "GAP_CHANGE_3M",
+                "GAP_STATUS_3M", "CURRENT_6M_GAP", "GAP_CHANGE_6M", "GAP_PERSISTENCE_STATUS",
+                "PRICE_PREMIUM_PCT", "CANDIDATE_3M_COUNT", "CANDIDATE_3M_SAMPLE_STATUS",
+                "CANDIDATE_RECENT_TRADE_AGE",
+            ]
+            st.dataframe(
+                filtered[core_columns], width="stretch", hide_index=True,
+                column_config={
+                    "CANDIDATE_COMPLEX": "후보 단지", "CANDIDATE_AREA_GROUP": "평형",
+                    "CURRENT_3M_GAP": st.column_config.NumberColumn("현재 3M GAP", format="%.2f억"),
+                    "GAP_CHANGE_3M": st.column_config.NumberColumn("3M GAP 변화", format="%+.2f억"),
+                    "GAP_STATUS_3M": "3M 상태", "CURRENT_6M_GAP": st.column_config.NumberColumn("현재 6M GAP", format="%.2f억"),
+                    "GAP_CHANGE_6M": st.column_config.NumberColumn("6M GAP 변화", format="%+.2f억"),
+                    "GAP_PERSISTENCE_STATUS": "GAP 지속성", "PRICE_PREMIUM_PCT": st.column_config.NumberColumn("가격 프리미엄", format="%+.1f%%"),
+                    "CANDIDATE_3M_COUNT": "3M 거래", "CANDIDATE_3M_SAMPLE_STATUS": "표본 상태",
+                    "CANDIDATE_RECENT_TRADE_AGE": "최근 거래 경과일",
+                },
+            )
+            with st.expander("후보 가격·거래량 상세 지표"):
+                st.dataframe(filtered, width="stretch", hide_index=True)
+
+else:
+    st.header("서울 주요 대단지 시장 참고")
+    keywords = [
+        "헬리오시티", "파크리오", "잠실엘스", "리센츠", "고덕그라시움",
+        "고덕아르테온", "올림픽선수기자촌", "센트라스", "마포래미안푸르지오", "올림픽파크포레온",
+    ]
+    mega_filtered = get_filtered_mega_data(df, keywords)
+    if mega_filtered.empty:
+        st.warning("분석할 주요 대단지 데이터가 없습니다.")
+    else:
+        left, right = st.columns(2)
+        with left:
+            st.subheader("주력 평형별 최신 실거래")
+            st.dataframe(
+                mega_filtered.sort_values("CTRT_DAY", ascending=False).head(50)[
+                    ["CTRT_DAY", "GROUP_NM", "MAIN_AREA", "THING_AMT", "FLR"]
+                ],
+                width="stretch", hide_index=True,
+            )
+        with right:
+            st.subheader("주력 평형 평균 가격 추이")
+            mega_trend = mega_filtered.groupby(["CONTRACT_YEAR_MONTH", "GROUP_NM"], as_index=False)["THING_AMT"].mean()
+            st.plotly_chart(
+                px.line(mega_trend, x="CONTRACT_YEAR_MONTH", y="THING_AMT", color="GROUP_NM", markers=True),
+                width="stretch",
+            )
+        mega_stats = mega_filtered.groupby(["GROUP_NM", "MAIN_AREA"], as_index=False).agg(
+            거래건수=("THING_AMT", "size"), 평균가_억=("THING_AMT", "mean"),
+            최고가_억=("THING_AMT", "max"), 최저가_억=("THING_AMT", "min"),
+        )
+        st.dataframe(mega_stats, width="stretch", hide_index=True)
+
+st.sidebar.caption("기본 모드는 저장된 CSV를 사용하며 API 조회는 고급 설정에서만 실행됩니다.")

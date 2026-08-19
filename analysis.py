@@ -473,6 +473,39 @@ def gap_change_status(gap_change: float | None) -> str:
     return "축소" if gap_change < 0 else "확대"
 
 
+def price_premium(candidate_price: float | None, base_price: float | None) -> float | None:
+    """Return the candidate's relative price premium over the base home."""
+    if candidate_price is None or base_price in {None, 0}:
+        return None
+    return (candidate_price / base_price - 1) * 100
+
+
+def gap_persistence_status(status_3m: str, status_6m: str) -> str:
+    """Describe observed GAP direction across two horizons without recommendation."""
+    if "N/A" in {status_3m, status_6m}:
+        return "판단 불가"
+    if status_3m == "축소" and status_6m == "축소":
+        return "지속 축소"
+    if status_3m == "확대" and status_6m == "확대":
+        return "지속 확대"
+    if status_3m == "축소" and status_6m == "확대":
+        return "단기 축소"
+    if status_3m == "확대" and status_6m == "축소":
+        return "단기 확대"
+    if status_3m == status_6m == "변화 없음":
+        return "변화 없음"
+    return "혼조"
+
+
+def monthly_gap_observation_status(observed_months: int) -> str:
+    """Observation-density notice, not a statistical confidence grade."""
+    if observed_months <= 2:
+        return "관측 부족"
+    if observed_months <= 5:
+        return "참고"
+    return "일반"
+
+
 def build_gap_change_metrics(base_period: dict, candidate_period: dict) -> dict:
     """Combine two matching period metrics into current/previous GAP metrics."""
     current_gap = _gap_value(
@@ -535,7 +568,7 @@ def build_trade_up_gap_comparison(
         analysis_as_of_date=as_of,
         data_available_from=data_available_from,
     )
-    return {
+    result = {
         "analysis_as_of_date": as_of,
         "base": _trade_up_home_summary(base_metrics, as_of),
         "candidate": _trade_up_home_summary(candidate_metrics, as_of),
@@ -556,6 +589,15 @@ def build_trade_up_gap_comparison(
             ),
         },
     }
+    result["price_premium_pct"] = price_premium(
+        candidate_metrics["3M"]["current"]["median_price"],
+        base_metrics["3M"]["current"]["median_price"],
+    )
+    result["gap_persistence_status"] = gap_persistence_status(
+        result["3M"]["gap_change_status"],
+        result["6M"]["gap_change_status"],
+    )
+    return result
 
 
 def build_monthly_gap_trend(
@@ -658,6 +700,8 @@ def build_multi_candidate_gap_comparison(
                     if gap_6m["gap_change_status"] == "N/A"
                     else gap_6m["gap_change_status"]
                 ),
+                "PRICE_PREMIUM_PCT": comparison["price_premium_pct"],
+                "GAP_PERSISTENCE_STATUS": comparison["gap_persistence_status"],
                 "CANDIDATE_3M_MEDIAN": candidate_metrics["3M"]["current"]["median_price"],
                 "CANDIDATE_PREVIOUS_3M_MEDIAN": candidate_metrics["3M"]["previous"]["median_price"],
                 "CANDIDATE_3M_COUNT": candidate_metrics["3M"]["current"]["transaction_count"],

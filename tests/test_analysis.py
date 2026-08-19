@@ -15,6 +15,9 @@ from analysis import (
     determine_analysis_as_of_date,
     filter_area_group,
     filter_complex_transactions,
+    gap_persistence_status,
+    monthly_gap_observation_status,
+    price_premium,
     sample_size_status,
     select_reference_price,
 )
@@ -51,6 +54,23 @@ def price_scope(amounts_and_dates, *, complex_id="complex-1", area_group="84㎡�
 
 
 class AnalysisTests(unittest.TestCase):
+    def test_price_premium_and_gap_persistence_are_observational(self):
+        self.assertAlmostEqual(price_premium(12.75, 7.4), 72.2972972973)
+        self.assertIsNone(price_premium(None, 7.4))
+        self.assertIsNone(price_premium(12.75, 0))
+        self.assertEqual(gap_persistence_status("축소", "축소"), "지속 축소")
+        self.assertEqual(gap_persistence_status("확대", "확대"), "지속 확대")
+        self.assertEqual(gap_persistence_status("축소", "확대"), "단기 축소")
+        self.assertEqual(gap_persistence_status("확대", "축소"), "단기 확대")
+        self.assertEqual(gap_persistence_status("N/A", "확대"), "판단 불가")
+
+    def test_monthly_gap_observation_status_is_density_notice(self):
+        self.assertEqual(monthly_gap_observation_status(0), "관측 부족")
+        self.assertEqual(monthly_gap_observation_status(2), "관측 부족")
+        self.assertEqual(monthly_gap_observation_status(3), "참고")
+        self.assertEqual(monthly_gap_observation_status(5), "참고")
+        self.assertEqual(monthly_gap_observation_status(6), "일반")
+
     def test_multi_candidate_gap_reuses_one_to_one_results(self):
         base = price_scope(
             [("2026-03-01", 7.0), ("2026-07-01", 8.0)],
@@ -99,6 +119,8 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(result.iloc[0]["GAP_CHANGE_6M"], direct["6M"]["gap_change"])
         self.assertEqual(result.iloc[0]["CANDIDATE_3M_COUNT"], 1)
         self.assertEqual(result.iloc[0]["CANDIDATE_3M_SAMPLE_STATUS"], "표본 적음")
+        self.assertAlmostEqual(result.iloc[0]["PRICE_PREMIUM_PCT"], 68.75)
+        self.assertEqual(result.iloc[0]["GAP_PERSISTENCE_STATUS"], "판단 불가")
         self.assertEqual(result.iloc[1]["GAP_STATUS_3M"], "비교불가")
 
     def test_trade_up_gap_uses_matching_current_and_previous_periods(self):
