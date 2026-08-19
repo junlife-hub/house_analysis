@@ -1,10 +1,10 @@
 {
-  "updated_at": "2026-08-17T20:47:32.812964+00:00",
-  "year": 2026,
-  "fetched_count": 85812,
-  "stored_count": 171038,
+  "updated_at": "2026-08-18T20:43:36.014964+00:00",
+  "receipt_year": 2026,
+  "fetched_count": 85833,
+  "stored_count": 256244,
   "within_snapshot_rows_removed": 0,
-  "snapshot_overlaps_removed": 580,
+  "snapshot_overlaps_removed": 627,
   "snapshot_match_columns": [
     "RCPT_YR",
     "CGG_CD",
