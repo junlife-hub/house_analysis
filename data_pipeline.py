@@ -77,6 +77,9 @@ NUMERIC_COLUMNS = [
     "ARCH_YR",
 ]
 
+DATE_KEY_COLUMNS = {"CTRT_DAY", "RTRCN_DAY"}
+MATCH_MISSING_SENTINEL = "<MISSING>"
+
 
 class SeoulApiError(RuntimeError):
     """Raised when the Seoul Open API returns an unusable response."""
@@ -181,12 +184,71 @@ def _canonical_match_key(df: pd.DataFrame, key_columns: list[str]) -> pd.DataFra
     for column in key_columns:
         series = df[column]
         if pd.api.types.is_datetime64_any_dtype(series):
-            canonical_key[column] = series.dt.strftime("%Y%m%d")
+            normalized = series.dt.strftime("%Y%m%d")
+        elif column in DATE_KEY_COLUMNS:
+            text = series.astype("string").str.strip()
+            compact = text.str.replace(r"\.0$", "", regex=True).str.replace(
+                r"[^0-9]", "", regex=True
+            )
+            parsed = pd.to_datetime(text, format="mixed", errors="coerce")
+            normalized = compact.where(
+                compact.str.fullmatch(r"\d{8}", na=False),
+                parsed.dt.strftime("%Y%m%d"),
+            )
         elif column in NUMERIC_COLUMNS:
-            canonical_key[column] = _clean_numeric(series)
+            normalized = _clean_numeric(series).map(
+                lambda value: _normalize_identifier_number(value, missing="")
+            )
         else:
-            canonical_key[column] = series.astype("string").str.strip()
+            normalized = series.astype("string").str.strip()
+        canonical_key[column] = normalized.astype("string").fillna(
+            MATCH_MISSING_SENTINEL
+        )
     return canonical_key
+
+
+def reconcile_receipt_year_snapshot(
+    existing: pd.DataFrame,
+    fetched: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict[str, int]]:
+    """Replace one receipt-year snapshot and report its observed delta.
+
+    The Seoul endpoint returns the complete RCPT_YR snapshot. The fetched
+    snapshot is therefore authoritative; appending prior snapshots would retain
+    stale mutable states and multiply unchanged transactions. Other receipt-year
+    files remain untouched, preserving cross-year cancellation history.
+    """
+    if fetched is None or fetched.empty:
+        raise SeoulApiError("API snapshot is empty; existing data was not replaced.")
+
+    latest = fetched.reset_index(drop=True).copy()
+    if existing is None or existing.empty:
+        return latest, {
+            "snapshot_overlaps": 0,
+            "new_or_changed_rows": int(len(latest)),
+            "stale_or_changed_rows_replaced": 0,
+        }
+
+    key_columns = _available_match_columns([existing, latest])
+    existing_key = _canonical_match_key(existing.reset_index(drop=True), key_columns)
+    latest_key = _canonical_match_key(latest, key_columns)
+    existing_occurrence = existing_key.groupby(
+        key_columns, dropna=False, sort=False
+    ).cumcount()
+    latest_occurrence = latest_key.groupby(
+        key_columns, dropna=False, sort=False
+    ).cumcount()
+    existing_key = existing_key.assign(_OCCURRENCE=existing_occurrence.to_numpy())
+    latest_key = latest_key.assign(_OCCURRENCE=latest_occurrence.to_numpy())
+    existing_index = pd.MultiIndex.from_frame(existing_key)
+    latest_index = pd.MultiIndex.from_frame(latest_key)
+    overlaps = int(latest_index.isin(existing_index).sum())
+    replaced = int((~existing_index.isin(latest_index)).sum())
+    return latest, {
+        "snapshot_overlaps": overlaps,
+        "new_or_changed_rows": int(len(latest) - overlaps),
+        "stale_or_changed_rows_replaced": replaced,
+    }
 
 
 def count_repeated_source_rows(df: pd.DataFrame) -> tuple[int, list[str]]:
@@ -679,6 +741,8 @@ def save_receipt_year_data(
     *,
     fetched_count: int,
     snapshot_overlaps_removed: int = 0,
+    new_or_changed_rows: int = 0,
+    stale_or_changed_rows_replaced: int = 0,
 ) -> dict:
     output_path = receipt_year_data_path(base_dir, receipt_year)
     _atomic_write_csv(df, output_path)
@@ -689,7 +753,10 @@ def save_receipt_year_data(
         "fetched_count": int(fetched_count),
         "stored_count": int(len(df)),
         "within_snapshot_rows_removed": 0,
+        "snapshot_storage_mode": "authoritative_replace",
         "snapshot_overlaps_removed": int(snapshot_overlaps_removed),
+        "new_or_changed_rows": int(new_or_changed_rows),
+        "stale_or_changed_rows_replaced": int(stale_or_changed_rows_replaced),
         "snapshot_match_columns": _available_match_columns([df]),
         "data_file": str(output_path.relative_to(Path(base_dir))).replace("\\", "/"),
     }
@@ -705,13 +772,15 @@ def update_receipt_year_data(
     fetched = fetch_api_data(api_key, receipt_year)
     existing_path = receipt_year_data_path(base_dir, receipt_year)
     existing = read_csv_file(existing_path) if existing_path.exists() else pd.DataFrame()
-    combined, merge_duplicates = combine_raw_data([existing, fetched])
+    reconciled, delta = reconcile_receipt_year_snapshot(existing, fetched)
     metadata = save_receipt_year_data(
-        combined,
+        reconciled,
         base_dir,
         receipt_year,
         fetched_count=len(fetched),
-        snapshot_overlaps_removed=merge_duplicates,
+        snapshot_overlaps_removed=delta["snapshot_overlaps"],
+        new_or_changed_rows=delta["new_or_changed_rows"],
+        stale_or_changed_rows_replaced=delta["stale_or_changed_rows_replaced"],
     )
     return metadata
 

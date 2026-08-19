@@ -6,6 +6,7 @@ import pandas as pd
 from data_pipeline import (
     DEFAULT_ANALYSIS_START_DATE,
     SERVICE_NAME,
+    SeoulApiError,
     assign_area_group,
     assign_complex_identity,
     build_effective_transactions,
@@ -16,6 +17,7 @@ from data_pipeline import (
     fetch_api_data,
     normalize_complex_name,
     preprocess_data,
+    reconcile_receipt_year_snapshot,
 )
 
 
@@ -225,6 +227,107 @@ class DataPipelineTests(unittest.TestCase):
 
         self.assertEqual(removed, 1)
         self.assertEqual(len(combined), 1)
+
+    def test_snapshot_reconciliation_normalizes_missing_zero_and_date_forms(self):
+        csv_row = {
+            "BLDG_NM": "테스트아파트",
+            "CTRT_DAY": 20260115,
+            "THING_AMT": 100000,
+            "ARCH_AREA": 84.9,
+            "LAND_AREA": 0.0,
+            "FLR": 10.0,
+            "RGHT_SE": float("nan"),
+            "RTRCN_DAY": float("nan"),
+        }
+        api_row = {
+            **csv_row,
+            "CTRT_DAY": "2026-01-15",
+            "LAND_AREA": "0",
+            "FLR": "10",
+            "RGHT_SE": None,
+            "RTRCN_DAY": "",
+        }
+
+        combined, removed = combine_raw_data(
+            [pd.DataFrame([csv_row]), pd.DataFrame([api_row])]
+        )
+
+        self.assertEqual(removed, 1)
+        self.assertEqual(len(combined), 1)
+
+    def test_authoritative_snapshot_is_idempotent(self):
+        rows = pd.DataFrame(
+            [
+                {
+                    "BLDG_NM": "테스트아파트",
+                    "CTRT_DAY": "2026-01-15",
+                    "THING_AMT": "100000",
+                    "ARCH_AREA": "84.9",
+                    "FLR": "10",
+                    "RGHT_SE": None,
+                },
+                {
+                    "BLDG_NM": "테스트아파트",
+                    "CTRT_DAY": "2026-01-15",
+                    "THING_AMT": "100000",
+                    "ARCH_AREA": "84.9",
+                    "FLR": "10",
+                    "RGHT_SE": None,
+                },
+            ]
+        )
+
+        first, _ = reconcile_receipt_year_snapshot(pd.DataFrame(), rows)
+        second, delta = reconcile_receipt_year_snapshot(first, rows.copy())
+
+        self.assertEqual(len(first), 2)
+        self.assertEqual(len(second), 2)
+        self.assertEqual(delta["snapshot_overlaps"], 2)
+        self.assertEqual(delta["new_or_changed_rows"], 0)
+        self.assertEqual(delta["stale_or_changed_rows_replaced"], 0)
+
+    def test_authoritative_snapshot_rejects_empty_fetch(self):
+        with self.assertRaisesRegex(SeoulApiError, "empty"):
+            reconcile_receipt_year_snapshot(
+                pd.DataFrame([{"BLDG_NM": "기존"}]), pd.DataFrame()
+            )
+
+    def test_authoritative_snapshot_applies_only_new_and_changed_state(self):
+        original = pd.DataFrame(
+            [
+                {
+                    "BLDG_NM": "기존",
+                    "CTRT_DAY": 20260115,
+                    "THING_AMT": 100000,
+                    "ARCH_AREA": 84.9,
+                    "FLR": 10,
+                    "OPBIZ_RESTAGNT_SGG_NM": None,
+                }
+            ]
+        )
+        next_day = pd.DataFrame(
+            [
+                {
+                    **original.iloc[0].to_dict(),
+                    "OPBIZ_RESTAGNT_SGG_NM": "서울 노원구",
+                },
+                {
+                    "BLDG_NM": "신규",
+                    "CTRT_DAY": 20260116,
+                    "THING_AMT": 110000,
+                    "ARCH_AREA": 84.9,
+                    "FLR": 11,
+                    "OPBIZ_RESTAGNT_SGG_NM": None,
+                },
+            ]
+        )
+
+        reconciled, delta = reconcile_receipt_year_snapshot(original, next_day)
+
+        self.assertEqual(len(reconciled), 2)
+        self.assertEqual(reconciled["BLDG_NM"].tolist(), ["기존", "신규"])
+        self.assertEqual(delta["new_or_changed_rows"], 2)
+        self.assertEqual(delta["stale_or_changed_rows_replaced"], 1)
 
     def test_snapshot_reconciliation_preserves_maximum_multiplicity(self):
         row = {
