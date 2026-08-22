@@ -95,7 +95,7 @@ st.markdown(
 )
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def load_cached_stored_data(
     signatures: tuple[tuple[str, int, int], ...],
 ) -> tuple[pd.DataFrame, dict]:
@@ -116,10 +116,65 @@ def fetch_cached_api_data(api_key: str, receipt_year: int) -> pd.DataFrame:
     return fetch_api_data(api_key, receipt_year)
 
 
+@st.cache_resource(show_spinner=False)
+def load_cached_api_combined_data(
+    signatures: tuple[tuple[str, int, int], ...],
+    api_key: str,
+    receipt_year: int,
+) -> tuple[pd.DataFrame, dict, int, int]:
+    """Cache the expensive API merge and full analysis preparation."""
+    del signatures
+    api_raw = fetch_cached_api_data(api_key, receipt_year)
+    stored_raw = load_stored_raw_data(BASE_DIR)
+    combined_raw, snapshot_overlaps = combine_raw_data([stored_raw, api_raw])
+    prepared, quality = preprocess_data(
+        combined_raw, analysis_start_date=ANALYSIS_START_DATE
+    )
+    effective, cancellation_quality = build_effective_transactions(prepared)
+    effective = assign_complex_identity(assign_area_group(effective))
+    return (
+        effective,
+        {**quality, **cancellation_quality},
+        int(len(api_raw)),
+        int(snapshot_overlaps),
+    )
+
+
 @st.cache_data(show_spinner=False)
 def load_cached_watchlist(path: str, modified_time_ns: int) -> pd.DataFrame:
     del modified_time_ns
     return load_watchlist(path)
+
+
+@st.cache_resource(show_spinner=False)
+def load_cached_watchlist_scopes(
+    signatures: tuple[tuple[str, int, int], ...],
+    watchlist_path: str,
+    watchlist_modified_time_ns: int,
+    data_source: str,
+    api_key: str,
+    receipt_year: int,
+) -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
+    """Build small per-complex frames once instead of scanning all rows per click."""
+    watchlist = load_cached_watchlist(watchlist_path, watchlist_modified_time_ns)
+    if data_source == "api":
+        transactions = load_cached_api_combined_data(
+            signatures, api_key, receipt_year
+        )[0]
+    else:
+        transactions = load_cached_stored_data(signatures)[0]
+
+    scopes = {
+        str(config["display_name"]): filter_complex_transactions(transactions, config)
+        for _, config in watchlist.iterrows()
+    }
+    non_empty = [scope for scope in scopes.values() if not scope.empty]
+    watchlist_transactions = (
+        pd.concat(non_empty, ignore_index=True, sort=False)
+        if non_empty
+        else transactions.iloc[0:0].copy()
+    )
+    return scopes, watchlist_transactions
 
 
 def format_date(value: object) -> str:
@@ -427,30 +482,29 @@ with st.sidebar.expander("고급 데이터 설정"):
     )
     if st.button("파일·캐시 새로고침"):
         st.cache_data.clear()
+        st.cache_resource.clear()
         st.rerun()
 
 file_signatures = data_file_signatures(BASE_DIR)
 with st.spinner("저장된 실거래 데이터를 불러오는 중입니다..."):
     df, quality = load_cached_stored_data(file_signatures)
 
+active_data_source = "stored"
 if data_mode == api_mode_label:
     if not API_KEY:
         st.sidebar.error("SEOUL_API_KEY가 없어 저장 파일만 표시합니다.")
     else:
         with st.spinner(f"{CURRENT_RECEIPT_YEAR}년 접수연도 API를 가져오는 중입니다..."):
             try:
-                api_raw = fetch_cached_api_data(API_KEY, CURRENT_RECEIPT_YEAR)
-                stored_raw = load_stored_raw_data(BASE_DIR)
-                combined_raw, snapshot_overlaps = combine_raw_data([stored_raw, api_raw])
-                prepared, quality = preprocess_data(
-                    combined_raw, analysis_start_date=ANALYSIS_START_DATE
+                df, quality, api_count, snapshot_overlaps = (
+                    load_cached_api_combined_data(
+                        file_signatures, API_KEY, CURRENT_RECEIPT_YEAR
+                    )
                 )
-                df, cancellation_quality = build_effective_transactions(prepared)
-                df = assign_complex_identity(assign_area_group(df))
-                quality = {**quality, **cancellation_quality}
                 st.sidebar.success(
-                    f"API {len(api_raw):,}건 병합 · 겹침 {snapshot_overlaps:,}건 제외"
+                    f"API {api_count:,}건 병합 · 겹침 {snapshot_overlaps:,}건 제외"
                 )
+                active_data_source = "api"
             except Exception as exc:
                 st.sidebar.error(f"API 수집 실패: {exc}")
 
@@ -460,7 +514,16 @@ if df.empty:
     st.error("표시할 실거래 데이터를 찾지 못했습니다.")
     st.stop()
 
-watchlist = load_cached_watchlist(str(WATCHLIST_PATH), WATCHLIST_PATH.stat().st_mtime_ns)
+watchlist_modified_time_ns = WATCHLIST_PATH.stat().st_mtime_ns
+watchlist = load_cached_watchlist(str(WATCHLIST_PATH), watchlist_modified_time_ns)
+watchlist_scopes, watchlist_transactions = load_cached_watchlist_scopes(
+    file_signatures,
+    str(WATCHLIST_PATH),
+    watchlist_modified_time_ns,
+    active_data_source,
+    API_KEY if active_data_source == "api" else "",
+    CURRENT_RECEIPT_YEAR,
+)
 metadata = read_update_metadata(BASE_DIR)
 status = build_data_status(df, CURRENT_CONTRACT_YEAR)
 analysis_as_of_date = determine_analysis_as_of_date(df)
@@ -542,8 +605,7 @@ elif page == "② 단지 상세":
     selected_name = selectors[0].selectbox(
         "단지", watchlist["display_name"].tolist(), key="detail_complex"
     )
-    selected_config = watchlist[watchlist["display_name"].eq(selected_name)].iloc[0]
-    complex_transactions = filter_complex_transactions(df, selected_config)
+    complex_transactions = watchlist_scopes[selected_name]
     area_summary = build_area_group_summary(complex_transactions)
     area_options = area_summary["AREA_GROUP"].tolist()
     default_area = "59㎡형" if selected_name == "태강아파트" and "59㎡형" in area_options else area_options[0]
@@ -608,8 +670,8 @@ elif page == "② 단지 상세":
 elif page == "③ 동일 평형 비교":
     st.header("Watchlist 동일 평형 비교")
     watchlist_area_groups = set()
-    for _, config in watchlist.iterrows():
-        watchlist_area_groups.update(filter_complex_transactions(df, config)["AREA_GROUP"].dropna())
+    for transactions in watchlist_scopes.values():
+        watchlist_area_groups.update(transactions["AREA_GROUP"].dropna())
     area_group_options = sorted(
         watchlist_area_groups, key=lambda value: float(str(value).replace("㎡형", ""))
     )
@@ -620,7 +682,7 @@ elif page == "③ 동일 평형 비교":
         key="same_area_group",
     )
     comparison = build_watchlist_area_comparison(
-        df,
+        watchlist_transactions,
         watchlist,
         area_group=selected_comparison_area,
         analysis_as_of_date=analysis_as_of_date,
@@ -677,8 +739,7 @@ elif page == "④ 갈아타기 분석":
         selectors = st.columns(2)
         with selectors[0]:
             base_name = st.selectbox("기준 단지", watchlist["display_name"].tolist(), key="v2_base_complex")
-            base_config = watchlist[watchlist["display_name"].eq(base_name)].iloc[0]
-            base_complex = filter_complex_transactions(df, base_config)
+            base_complex = watchlist_scopes[base_name]
             base_areas = build_area_group_summary(base_complex)["AREA_GROUP"].tolist()
             base_default = "59㎡형" if "59㎡형" in base_areas else base_areas[0]
             base_area = st.selectbox("기준 평형", base_areas, index=base_areas.index(base_default), key="v2_base_area")
@@ -687,8 +748,7 @@ elif page == "④ 갈아타기 분석":
             candidate_name = st.selectbox(
                 "후보 단지", watchlist["display_name"].tolist(), index=candidate_default, key="v2_candidate_complex"
             )
-            candidate_config = watchlist[watchlist["display_name"].eq(candidate_name)].iloc[0]
-            candidate_complex = filter_complex_transactions(df, candidate_config)
+            candidate_complex = watchlist_scopes[candidate_name]
             candidate_areas = build_area_group_summary(candidate_complex)["AREA_GROUP"].tolist()
             candidate_default_area = "84㎡형" if "84㎡형" in candidate_areas else candidate_areas[0]
             candidate_area = st.selectbox(
@@ -775,8 +835,7 @@ elif page == "④ 갈아타기 분석":
     else:
         ref_cols = st.columns(2)
         multi_base_name = ref_cols[0].selectbox("기준 단지", watchlist["display_name"].tolist(), key="v2_multi_base")
-        multi_base_config = watchlist[watchlist["display_name"].eq(multi_base_name)].iloc[0]
-        multi_base_complex = filter_complex_transactions(df, multi_base_config)
+        multi_base_complex = watchlist_scopes[multi_base_name]
         multi_base_areas = build_area_group_summary(multi_base_complex)["AREA_GROUP"].tolist()
         multi_default = "59㎡형" if "59㎡형" in multi_base_areas else multi_base_areas[0]
         multi_base_area = ref_cols[1].selectbox(
@@ -800,8 +859,7 @@ elif page == "④ 갈아타기 분석":
         with st.expander("후보별 목표 평형 설정"):
             area_columns = st.columns(3)
             for position, candidate_name in enumerate(selected_candidates):
-                config = watchlist[watchlist["display_name"].eq(candidate_name)].iloc[0]
-                transactions = filter_complex_transactions(df, config)
+                transactions = watchlist_scopes[candidate_name]
                 options = build_area_group_summary(transactions)["AREA_GROUP"].tolist()
                 preferred = "112㎡형" if candidate_name == "한진해모로" and "112㎡형" in options else "84㎡형" if "84㎡형" in options else options[0]
                 with area_columns[position % 3]:
