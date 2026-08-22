@@ -7,6 +7,9 @@ from analysis import (
     build_monthly_trend,
     build_monthly_price_volume_trend,
     build_monthly_gap_trend,
+    build_market_area_monthly_trend,
+    build_district_market_comparison,
+    build_complex_area_market_screen,
     build_multi_candidate_gap_comparison,
     build_price_change_metrics,
     build_trade_up_gap_comparison,
@@ -54,6 +57,74 @@ def price_scope(amounts_and_dates, *, complex_id="complex-1", area_group="84㎡�
 
 
 class AnalysisTests(unittest.TestCase):
+    def test_market_area_trend_never_mixes_area_groups(self):
+        data = pd.DataFrame(
+            {
+                "CONTRACT_YEAR_MONTH": ["2026-01", "2026-01", "2026-01"],
+                "AREA_GROUP": ["59㎡형", "59㎡형", "84㎡형"],
+                "THING_AMT": [8.0, 10.0, 15.0],
+            }
+        )
+
+        result = build_market_area_monthly_trend(data)
+
+        self.assertEqual(len(result), 2)
+        fifty_nine = result[result["AREA_GROUP"].eq("59㎡형")].iloc[0]
+        self.assertEqual(fifty_nine["TRANSACTION_COUNT"], 2)
+        self.assertEqual(fifty_nine["MEDIAN_PRICE"], 9.0)
+
+    def test_district_market_comparison_requires_price_sample(self):
+        data = pd.DataFrame(
+            {
+                "CGG_NM": ["A구"] * 6 + ["B구"] * 2,
+                "AREA_GROUP": ["84㎡형"] * 8,
+                "CTRT_DAY": pd.to_datetime(
+                    ["2026-02-20", "2026-03-01", "2026-04-01", "2026-06-01", "2026-07-01", "2026-08-01", "2026-04-01", "2026-08-01"]
+                ),
+                "THING_AMT": [10.0, 10.0, 10.0, 12.0, 12.0, 12.0, 8.0, 9.0],
+            }
+        )
+
+        result = build_district_market_comparison(
+            data,
+            area_group="84㎡형",
+            analysis_as_of_date="2026-08-14",
+            minimum_sample=3,
+        ).set_index("DISTRICT")
+
+        self.assertAlmostEqual(result.loc["A구", "PRICE_CHANGE_PCT"], 20.0)
+        self.assertEqual(result.loc["A구", "SAMPLE_STATUS"], "일반")
+        self.assertTrue(pd.isna(result.loc["B구", "PRICE_CHANGE_PCT"]))
+        self.assertEqual(result.loc["B구", "SAMPLE_STATUS"], "표본 부족")
+
+    def test_complex_area_market_screen_keeps_scope_and_periods_separate(self):
+        data = pd.DataFrame(
+            {
+                "COMPLEX_ID": ["A"] * 7 + ["B"],
+                "AREA_GROUP": ["84㎡형"] * 8,
+                "CTRT_DAY": pd.to_datetime(
+                    ["2026-02-20", "2026-03-01", "2026-04-01", "2026-06-01", "2026-07-01", "2026-08-01", "2026-08-10", "2026-08-01"]
+                ),
+                "THING_AMT": [10.0, 10.0, 10.0, 12.0, 12.0, 12.0, 14.0, 8.0],
+                "BLDG_NM": ["A단지"] * 7 + ["B단지"],
+                "CGG_NM": ["A구"] * 7 + ["B구"],
+                "STDG_NM": ["A동"] * 7 + ["B동"],
+            }
+        )
+
+        result = build_complex_area_market_screen(
+            data,
+            analysis_as_of_date="2026-08-14",
+            minimum_sample=3,
+        ).set_index("COMPLEX_ID")
+
+        self.assertEqual(result.loc["A", "CURRENT_COUNT"], 4)
+        self.assertEqual(result.loc["A", "PREVIOUS_COUNT"], 3)
+        self.assertEqual(result.loc["A", "CURRENT_MEDIAN_PRICE"], 12.0)
+        self.assertAlmostEqual(result.loc["A", "PRICE_CHANGE_PCT"], 20.0)
+        self.assertEqual(result.loc["A", "LATEST_PRICE"], 14.0)
+        self.assertEqual(result.loc["B", "SAMPLE_STATUS"], "표본 부족")
+
     def test_price_premium_and_gap_persistence_are_observational(self):
         self.assertAlmostEqual(price_premium(12.75, 7.4), 72.2972972973)
         self.assertIsNone(price_premium(None, 7.4))

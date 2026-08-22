@@ -8,7 +8,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
+from plotly.subplots import make_subplots
 from dotenv import load_dotenv
 
 from analysis import (
@@ -16,6 +18,9 @@ from analysis import (
     build_monthly_trend,
     build_monthly_price_volume_trend,
     build_monthly_gap_trend,
+    build_market_area_monthly_trend,
+    build_district_market_comparison,
+    build_complex_area_market_screen,
     build_multi_candidate_gap_comparison,
     build_price_change_metrics,
     build_trade_up_gap_comparison,
@@ -168,13 +173,40 @@ def load_cached_watchlist_scopes(
         str(config["display_name"]): filter_complex_transactions(transactions, config)
         for _, config in watchlist.iterrows()
     }
-    non_empty = [scope for scope in scopes.values() if not scope.empty]
+    non_empty = [
+        scope.assign(WATCHLIST_NAME=name)
+        for name, scope in scopes.items()
+        if not scope.empty
+    ]
     watchlist_transactions = (
         pd.concat(non_empty, ignore_index=True, sort=False)
         if non_empty
         else transactions.iloc[0:0].copy()
     )
     return scopes, watchlist_transactions
+
+
+@st.cache_resource(show_spinner=False)
+def load_cached_market_screen(
+    signatures: tuple[tuple[str, int, int], ...],
+    data_source: str,
+    api_key: str,
+    receipt_year: int,
+) -> pd.DataFrame:
+    """Cache the complex × area screener used by market discovery pages."""
+    if data_source == "api":
+        transactions = load_cached_api_combined_data(
+            signatures, api_key, receipt_year
+        )[0]
+    else:
+        transactions = load_cached_stored_data(signatures)[0]
+    as_of = determine_analysis_as_of_date(transactions)
+    if as_of is None:
+        return pd.DataFrame()
+    return build_complex_area_market_screen(
+        transactions,
+        analysis_as_of_date=as_of,
+    )
 
 
 def format_date(value: object) -> str:
@@ -466,12 +498,144 @@ def render_price_volume_analysis(
         )
 
 
+def render_integrated_trade_chart(
+    transactions: pd.DataFrame,
+    *,
+    title: str,
+) -> None:
+    """Show monthly median, volume, and individual trades in one figure."""
+    start = transactions["CTRT_DAY"].min()
+    end = transactions["CTRT_DAY"].max()
+    trend = build_monthly_price_volume_trend(
+        transactions, start_date=start, end_date=end
+    ).tail(18)
+    figure = make_subplots(specs=[[{"secondary_y": True}]])
+    figure.add_trace(
+        go.Bar(
+            x=trend["CONTRACT_YEAR_MONTH"],
+            y=trend["TRANSACTION_COUNT"],
+            name="월 거래건수",
+            marker_color="rgba(76, 120, 168, 0.28)",
+        ),
+        secondary_y=True,
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=trend["CONTRACT_YEAR_MONTH"],
+            y=trend["MEDIAN_PRICE"],
+            name="월 중앙가격",
+            mode="lines+markers",
+            line={"color": "#e45756", "width": 3},
+        ),
+        secondary_y=False,
+    )
+    recent_start = pd.Period(trend.iloc[0]["CONTRACT_YEAR_MONTH"], freq="M").start_time
+    trades = transactions[transactions["CTRT_DAY"].ge(recent_start)]
+    figure.add_trace(
+        go.Scatter(
+            x=trades["CTRT_DAY"],
+            y=trades["THING_AMT"],
+            name="개별 실거래",
+            mode="markers",
+            marker={"size": 7, "color": trades["FLR"], "colorscale": "Blues", "opacity": 0.65},
+            customdata=trades[["ARCH_AREA", "FLR"]],
+            hovertemplate="%{x|%Y-%m-%d}<br>%{y:.2f}억<br>%{customdata[0]:.2f}㎡ · %{customdata[1]}층<extra></extra>",
+        ),
+        secondary_y=False,
+    )
+    figure.update_yaxes(title_text="가격(억)", secondary_y=False)
+    figure.update_yaxes(title_text="거래건수", secondary_y=True, rangemode="tozero")
+    figure.update_layout(title=title, hovermode="x unified", legend_orientation="h")
+    st.plotly_chart(figure, width="stretch")
+
+
+def render_gap_integrated_chart(monthly_gap: pd.DataFrame) -> None:
+    figure = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        row_heights=[0.62, 0.38],
+        vertical_spacing=0.08,
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=monthly_gap["CONTRACT_YEAR_MONTH"],
+            y=monthly_gap["BASE_MEDIAN_PRICE"],
+            name="기준 가격",
+            mode="lines+markers",
+        ),
+        row=1,
+        col=1,
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=monthly_gap["CONTRACT_YEAR_MONTH"],
+            y=monthly_gap["CANDIDATE_MEDIAN_PRICE"],
+            name="후보 가격",
+            mode="lines+markers",
+        ),
+        row=1,
+        col=1,
+    )
+    gap_colors = ["#f28e2b" if value >= 0 else "#4e79a7" for value in monthly_gap["MONTHLY_GAP"].fillna(0)]
+    figure.add_trace(
+        go.Bar(
+            x=monthly_gap["CONTRACT_YEAR_MONTH"],
+            y=monthly_gap["MONTHLY_GAP"],
+            name="월 GAP",
+            marker_color=gap_colors,
+        ),
+        row=2,
+        col=1,
+    )
+    figure.add_hline(y=0, line_dash="dot", line_color="gray", row=2, col=1)
+    figure.update_yaxes(title_text="가격(억)", row=1, col=1)
+    figure.update_yaxes(title_text="GAP(억)", row=2, col=1)
+    figure.update_layout(height=560, hovermode="x unified", legend_orientation="h")
+    st.plotly_chart(figure, width="stretch")
+
+
+def render_funding_waterfall(
+    *,
+    base_price: float,
+    candidate_price: float,
+    acquisition_cost: float,
+    available_cash: float,
+) -> None:
+    required = candidate_price - base_price + acquisition_cost - available_cash
+    figure = go.Figure(
+        go.Waterfall(
+            measure=["absolute", "relative", "relative", "relative", "total"],
+            x=["후보 기준가격", "보유주택 처분가", "취득 부대비용", "추가 가용현금", "예상 추가 필요자금"],
+            y=[candidate_price, -base_price, acquisition_cost, -available_cash, required],
+            text=[f"{candidate_price:.2f}억", f"-{base_price:.2f}억", f"+{acquisition_cost:.2f}억", f"-{available_cash:.2f}억", f"{required:.2f}억"],
+            textposition="outside",
+            connector={"line": {"color": "#999"}},
+        )
+    )
+    figure.update_layout(title="갈아타기 추가 필요자금", yaxis_title="금액(억)")
+    st.plotly_chart(figure, width="stretch")
+    st.caption("세금·중개보수·대출비용 등 부대비용은 사용자가 입력한 가정값이며 실거래 통계와 구분됩니다.")
+
+
 st.sidebar.title("HomeAnalysis")
-page = st.sidebar.radio(
-    "화면",
-    ["① 요약", "② 단지 상세", "③ 동일 평형 비교", "④ 갈아타기 분석", "⑤ 시장 참고"],
-    key="page_navigation",
+analysis_domain = st.sidebar.radio(
+    "분석 영역",
+    ["시장 흐름", "나의 관심 단지"],
+    key="analysis_domain",
 )
+if analysis_domain == "시장 흐름":
+    page = st.sidebar.radio(
+        "시장 화면",
+        ["시장 요약", "지역·평형", "가격대별 탐색", "단지 움직임", "주요 대단지"],
+        key="market_page_navigation",
+    )
+else:
+    page = st.sidebar.radio(
+        "관심 단지 화면",
+        ["단지 상세", "동일 평형 비교", "갈아타기 분석"],
+        key="watchlist_page_navigation",
+    )
 
 api_mode_label = f"저장 파일 + {CURRENT_RECEIPT_YEAR}년 접수연도 API"
 with st.sidebar.expander("고급 데이터 설정"):
@@ -532,6 +696,15 @@ if analysis_as_of_date is None:
     st.stop()
 data_available_from = pd.Timestamp(df["CONTRACT_DATE"].min()).normalize()
 delay_days = max((pd.Timestamp(dt.date.today()) - analysis_as_of_date).days, 0)
+market_screen = pd.DataFrame()
+if page in {"가격대별 탐색", "단지 움직임"}:
+    with st.spinner("단지별 최근 시장 지표를 준비하는 중입니다..."):
+        market_screen = load_cached_market_screen(
+            file_signatures,
+            active_data_source,
+            API_KEY if active_data_source == "api" else "",
+            CURRENT_RECEIPT_YEAR,
+        )
 
 status_columns = st.columns(3)
 status_columns[0].metric("데이터 기준일", format_date(analysis_as_of_date))
@@ -565,14 +738,29 @@ if status["missing_past_months"]:
     )
     st.warning(f"이미 지난 계약월 중 데이터가 없는 기간: {missing_labels}")
 
-if page == "① 요약":
-    st.header("전체 상황")
+if page == "시장 요약":
+    st.header("서울 시장 흐름")
     st.write(
-        "단지 상세에서 가격 흐름을 확인하고, 동일 평형 비교로 후보를 좁힌 뒤, "
-        "갈아타기 분석에서 기준 주택과 후보의 GAP 변화를 확인하세요."
+        "거래량과 평형별 중앙가격을 함께 확인합니다. 전체 중앙가격은 거래 구성의 영향을 받으므로 "
+        "가격지수가 아니라 실제 거래 표본의 흐름으로 해석하세요."
     )
     overview = build_monthly_trend(df)
     recent_overview = overview.tail(12)
+    completed_overview = overview.iloc[:-1] if len(overview) > 1 else overview
+    latest_completed = completed_overview.iloc[-1]
+    previous_completed = completed_overview.iloc[-2] if len(completed_overview) > 1 else latest_completed
+    volume_change = (
+        (latest_completed["거래건수"] - previous_completed["거래건수"])
+        / previous_completed["거래건수"]
+        * 100
+        if previous_completed["거래건수"]
+        else None
+    )
+    market_kpis = st.columns(4)
+    market_kpis[0].metric("최근 완결월", latest_completed["CONTRACT_YEAR_MONTH"])
+    market_kpis[1].metric("월 거래건수", f"{int(latest_completed['거래건수']):,}건")
+    market_kpis[2].metric("직전월 대비 거래량", format_optional_pct(volume_change))
+    market_kpis[3].metric("거래 구성 중앙가격", format_optional_money(latest_completed["중앙값"]))
     left, right = st.columns(2)
     with left:
         st.subheader("최근 월별 거래량")
@@ -586,20 +774,239 @@ if page == "① 요약":
             width="stretch",
         )
     with right:
-        st.subheader("최근 월별 중앙가격")
+        st.subheader("평형별 중앙가격")
+        area_market = build_market_area_monthly_trend(
+            df,
+            area_groups=["59㎡형", "84㎡형", "114㎡형"],
+        )
         st.plotly_chart(
             px.line(
-                recent_overview,
+                area_market[area_market["CONTRACT_YEAR_MONTH"].isin(recent_overview["CONTRACT_YEAR_MONTH"])],
                 x="CONTRACT_YEAR_MONTH",
-                y="중앙값",
+                y="MEDIAN_PRICE",
+                color="AREA_GROUP",
                 markers=True,
-                labels={"CONTRACT_YEAR_MONTH": "계약연월", "중앙값": "중앙가격(억)"},
+                custom_data=["TRANSACTION_COUNT"],
+                labels={"CONTRACT_YEAR_MONTH": "계약연월", "MEDIAN_PRICE": "중앙가격(억)", "AREA_GROUP": "평형"},
             ),
             width="stretch",
         )
-    st.info("가격 비교는 서로 다른 면적이 섞이지 않도록 단지 × 전용면적 그룹 화면을 이용하세요.")
+    st.info("현재 계약월은 신고가 진행 중이므로 거래량 비교에서는 직전 완결월을 우선 확인하세요.")
 
-elif page == "② 단지 상세":
+elif page == "지역·평형":
+    st.header("지역·평형별 시장 온도")
+    market_areas = [area for area in ["59㎡형", "84㎡형", "114㎡형"] if area in set(df["AREA_GROUP"].dropna())]
+    selected_market_area = st.selectbox(
+        "전용면적 그룹",
+        market_areas,
+        index=market_areas.index("84㎡형") if "84㎡형" in market_areas else 0,
+        key="market_area_group",
+    )
+    district_market = build_district_market_comparison(
+        df,
+        area_group=selected_market_area,
+        analysis_as_of_date=analysis_as_of_date,
+    )
+    comparable = district_market[district_market["SAMPLE_STATUS"].eq("일반")].copy()
+    breadth = st.columns(4)
+    breadth[0].metric("가격 상승 자치구", f"{int(comparable['PRICE_CHANGE_PCT'].gt(0).sum())}개")
+    breadth[1].metric("가격 하락 자치구", f"{int(comparable['PRICE_CHANGE_PCT'].lt(0).sum())}개")
+    breadth[2].metric("거래 증가 자치구", f"{int(comparable['VOLUME_CHANGE_PCT'].gt(0).sum())}개")
+    breadth[3].metric("비교 가능 자치구", f"{len(comparable)}개")
+    heatmap_data = district_market.set_index("DISTRICT")[["PRICE_CHANGE_PCT", "VOLUME_CHANGE_PCT"]].rename(
+        columns={"PRICE_CHANGE_PCT": "가격 변화율", "VOLUME_CHANGE_PCT": "거래량 변화율"}
+    )
+    left, right = st.columns([1, 1.15])
+    with left:
+        st.subheader("자치구 변화 히트맵")
+        st.plotly_chart(
+            px.imshow(
+                heatmap_data,
+                text_auto=".1f",
+                aspect="auto",
+                color_continuous_scale="RdBu_r",
+                color_continuous_midpoint=0,
+                labels={"color": "변화율(%)"},
+            ),
+            width="stretch",
+        )
+    with right:
+        st.subheader("가격·거래량 사분면")
+        st.plotly_chart(
+            px.scatter(
+                comparable,
+                x="VOLUME_CHANGE_PCT",
+                y="PRICE_CHANGE_PCT",
+                size="CURRENT_COUNT",
+                color="DISTRICT",
+                hover_name="DISTRICT",
+                labels={"VOLUME_CHANGE_PCT": "거래량 변화율(%)", "PRICE_CHANGE_PCT": "가격 변화율(%)", "CURRENT_COUNT": "최근 거래"},
+            ).add_hline(y=0, line_dash="dot", line_color="gray").add_vline(x=0, line_dash="dot", line_color="gray"),
+            width="stretch",
+        )
+    st.dataframe(district_market, width="stretch", hide_index=True)
+
+elif page == "가격대별 탐색":
+    st.header("가격대별 실거래 탐색")
+    st.caption("최근 3개월 중앙가격이 예산 범위에 포함되는 단지 × 평형 후보를 찾습니다.")
+    controls = st.columns([1, 1, 1, 1, 1])
+    screen_areas = sorted(
+        market_screen["AREA_GROUP"].dropna().unique(),
+        key=lambda value: float(str(value).replace("㎡형", "")),
+    )
+    budget_area = controls[0].selectbox(
+        "평형",
+        screen_areas,
+        index=screen_areas.index("84㎡형") if "84㎡형" in screen_areas else 0,
+        key="budget_area",
+    )
+    district_options = ["전체"] + sorted(market_screen["CGG_NM"].dropna().unique().tolist())
+    budget_district = controls[1].selectbox("자치구", district_options, key="budget_district")
+    budget_min = controls[2].number_input("최소 예산(억)", min_value=0.0, value=6.0, step=0.5, key="budget_min")
+    budget_max = controls[3].number_input("최대 예산(억)", min_value=0.0, value=15.0, step=0.5, key="budget_max")
+    minimum_trades = controls[4].number_input("최소 3M 거래", min_value=1, value=3, step=1, key="budget_minimum_trades")
+    if budget_min > budget_max:
+        st.warning("최소 예산은 최대 예산보다 클 수 없습니다.")
+        candidates = market_screen.iloc[0:0]
+    else:
+        candidates = market_screen[
+            market_screen["AREA_GROUP"].eq(budget_area)
+            & market_screen["CURRENT_MEDIAN_PRICE"].between(budget_min, budget_max)
+            & market_screen["CURRENT_COUNT"].ge(minimum_trades)
+        ].copy()
+        if budget_district != "전체":
+            candidates = candidates[candidates["CGG_NM"].eq(budget_district)]
+    candidate_kpis = st.columns(4)
+    candidate_kpis[0].metric("조건 충족 후보", f"{len(candidates):,}개")
+    candidate_kpis[1].metric("포함 자치구", f"{candidates['CGG_NM'].nunique():,}개")
+    candidate_kpis[2].metric("후보 3M 거래", f"{int(candidates['CURRENT_COUNT'].sum()):,}건")
+    candidate_kpis[3].metric(
+        "후보 중앙가격 중앙값",
+        format_optional_money(candidates["CURRENT_MEDIAN_PRICE"].median() if not candidates.empty else None),
+    )
+    if candidates.empty:
+        st.info("현재 조건을 충족하는 단지가 없습니다. 예산 범위나 최소 거래건수를 조정해보세요.")
+    else:
+        st.plotly_chart(
+            px.scatter(
+                candidates,
+                x="CURRENT_MEDIAN_PRICE",
+                y="CURRENT_COUNT",
+                size="TWELVE_MONTH_COUNT",
+                color="CGG_NM",
+                hover_name="BLDG_NM",
+                custom_data=["STDG_NM", "LATEST_PRICE", "LATEST_CONTRACT_DATE", "PRICE_CHANGE_PCT"],
+                labels={"CURRENT_MEDIAN_PRICE": "최근 3M 중앙가격(억)", "CURRENT_COUNT": "최근 3M 거래건수", "CGG_NM": "자치구", "TWELVE_MONTH_COUNT": "12M 거래"},
+            ),
+            width="stretch",
+        )
+        candidate_columns = [
+            "BLDG_NM", "CGG_NM", "STDG_NM", "AREA_GROUP", "CURRENT_MEDIAN_PRICE",
+            "LATEST_PRICE", "CURRENT_COUNT", "PRICE_CHANGE_PCT", "VOLUME_CHANGE_PCT",
+            "HIGH_GAP_PCT", "LATEST_CONTRACT_DATE", "SAMPLE_STATUS",
+        ]
+        st.dataframe(
+            candidates[candidate_columns].sort_values(["CURRENT_MEDIAN_PRICE", "CURRENT_COUNT"], ascending=[True, False]),
+            width="stretch",
+            hide_index=True,
+        )
+
+    st.subheader("가격대 × 자치구 최근 실거래")
+    recent_start = analysis_as_of_date - pd.DateOffset(months=3) + pd.Timedelta(days=1)
+    recent_trades = df[
+        df["AREA_GROUP"].eq(budget_area)
+        & df["CTRT_DAY"].between(recent_start, analysis_as_of_date)
+    ].copy()
+    price_labels = ["6억 이하", "6~9억", "9~12억", "12~15억", "15~20억", "20억 이상"]
+    recent_trades["PRICE_BAND"] = pd.cut(
+        recent_trades["THING_AMT"],
+        bins=[0, 6, 9, 12, 15, 20, np.inf],
+        labels=price_labels,
+        include_lowest=True,
+        right=True,
+    )
+    price_heatmap = pd.crosstab(recent_trades["CGG_NM"], recent_trades["PRICE_BAND"], dropna=False).reindex(columns=price_labels, fill_value=0)
+    st.plotly_chart(
+        px.imshow(
+            price_heatmap,
+            text_auto=True,
+            aspect="auto",
+            color_continuous_scale="Blues",
+            labels={"x": "실거래 가격대", "y": "자치구", "color": "거래건수"},
+        ),
+        width="stretch",
+    )
+
+elif page == "단지 움직임":
+    st.header("단지 움직임")
+    st.caption("동일 단지·동일 평형의 최근 3개월과 직전 3개월을 비교한 관찰 지표입니다.")
+    controls = st.columns(3)
+    movement_type = controls[0].selectbox(
+        "관찰 유형",
+        ["거래 활발", "거래량 급증", "가격 상승", "가격 조정", "고점 접근"],
+        key="movement_type",
+    )
+    movement_areas = ["전체"] + sorted(
+        market_screen["AREA_GROUP"].dropna().unique(),
+        key=lambda value: float(str(value).replace("㎡형", "")),
+    )
+    movement_area = controls[1].selectbox("평형", movement_areas, key="movement_area")
+    movement_districts = ["전체"] + sorted(market_screen["CGG_NM"].dropna().unique().tolist())
+    movement_district = controls[2].selectbox("자치구", movement_districts, key="movement_district")
+    movement = market_screen.copy()
+    if movement_area != "전체":
+        movement = movement[movement["AREA_GROUP"].eq(movement_area)]
+    if movement_district != "전체":
+        movement = movement[movement["CGG_NM"].eq(movement_district)]
+    if movement_type == "거래 활발":
+        movement = movement.sort_values("CURRENT_COUNT", ascending=False)
+        metric_column, metric_label = "CURRENT_COUNT", "최근 3M 거래건수"
+    elif movement_type == "거래량 급증":
+        movement = movement[
+            movement["CURRENT_COUNT"].add(movement["PREVIOUS_COUNT"]).ge(5)
+            & movement["VOLUME_CHANGE_PCT"].gt(0)
+        ].sort_values("VOLUME_CHANGE_PCT", ascending=False)
+        metric_column, metric_label = "VOLUME_CHANGE_PCT", "거래량 변화율(%)"
+    elif movement_type == "가격 상승":
+        movement = movement[
+            movement["SAMPLE_STATUS"].eq("일반") & movement["PRICE_CHANGE_PCT"].gt(0)
+        ].sort_values("PRICE_CHANGE_PCT", ascending=False)
+        metric_column, metric_label = "PRICE_CHANGE_PCT", "가격 변화율(%)"
+    elif movement_type == "가격 조정":
+        movement = movement[
+            movement["SAMPLE_STATUS"].eq("일반") & movement["PRICE_CHANGE_PCT"].lt(0)
+        ].sort_values("PRICE_CHANGE_PCT")
+        metric_column, metric_label = "PRICE_CHANGE_PCT", "가격 변화율(%)"
+    else:
+        movement = movement[
+            movement["CURRENT_COUNT"].ge(3) & movement["HIGH_GAP_PCT"].ge(-3)
+        ].sort_values("HIGH_GAP_PCT", ascending=False)
+        metric_column, metric_label = "HIGH_GAP_PCT", "12M 고점 대비(%)"
+    movement = movement.head(30).copy()
+    if movement.empty:
+        st.info("현재 조건에 해당하는 단지가 없습니다.")
+    else:
+        movement["COMPLEX_AREA_LABEL"] = movement["BLDG_NM"] + " · " + movement["AREA_GROUP"]
+        st.plotly_chart(
+            px.bar(
+                movement.sort_values(metric_column),
+                x=metric_column,
+                y="COMPLEX_AREA_LABEL",
+                orientation="h",
+                color="CGG_NM",
+                labels={metric_column: metric_label, "COMPLEX_AREA_LABEL": "단지·평형", "CGG_NM": "자치구"},
+            ),
+            width="stretch",
+        )
+        st.dataframe(
+            movement[
+                ["BLDG_NM", "CGG_NM", "STDG_NM", "AREA_GROUP", "CURRENT_MEDIAN_PRICE", "CURRENT_COUNT", "PREVIOUS_COUNT", "PRICE_CHANGE_PCT", "VOLUME_CHANGE_PCT", "HIGH_GAP_PCT", "LATEST_CONTRACT_DATE", "SAMPLE_STATUS"]
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+
+elif page == "단지 상세":
     st.header("단지 상세")
     selectors = st.columns(2)
     selected_name = selectors[0].selectbox(
@@ -641,10 +1048,21 @@ elif page == "② 단지 상세":
         twelve_cols[3].metric("12M 최저가", format_optional_money(twelve["lowest_price"]))
         twelve_cols[4].metric("고점 대비", format_optional_pct(metrics["12M"]["high_gap_pct"]))
     with st.expander("월별 가격·거래량", expanded=True):
-        render_monthly_chart(
+        render_integrated_trade_chart(
             selected_transactions,
-            title_prefix=f"{selected_name} {selected_area}",
-            key_prefix="detail",
+            title=f"{selected_name} {selected_area} 가격·거래량·개별 실거래",
+        )
+    with st.expander("단지 내 평형별 상대 가격"):
+        st.plotly_chart(
+            px.bar(
+                area_summary,
+                x="AREA_GROUP",
+                y="MEDIAN_PRICE",
+                color="TRANSACTION_COUNT",
+                text="TRANSACTION_COUNT",
+                labels={"AREA_GROUP": "평형", "MEDIAN_PRICE": "전체기간 중앙가격(억)", "TRANSACTION_COUNT": "거래건수"},
+            ),
+            width="stretch",
         )
     with st.expander("실거래 상세내역과 층별 분포"):
         detail = selected_transactions.sort_values("CTRT_DAY", ascending=False)
@@ -667,7 +1085,7 @@ elif page == "② 단지 상세":
             width="stretch",
         )
 
-elif page == "③ 동일 평형 비교":
+elif page == "동일 평형 비교":
     st.header("Watchlist 동일 평형 비교")
     watchlist_area_groups = set()
     for transactions in watchlist_scopes.values():
@@ -730,8 +1148,42 @@ elif page == "③ 동일 평형 비교":
     missing_count = int((~comparison["AREA_AVAILABLE"]).sum())
     if missing_count:
         st.info(f"{missing_count}개 단지는 {selected_comparison_area}이 없어 '해당 평형 없음'으로 유지했습니다.")
+    comparable_watchlist = comparison[comparison["AREA_AVAILABLE"]].dropna(
+        subset=["3M_CHANGE_PCT", "CURRENT_3M_COUNT"]
+    )
+    visual_left, visual_right = st.columns(2)
+    with visual_left:
+        st.subheader("가격 변화·거래량 사분면")
+        quadrant = px.scatter(
+            comparable_watchlist,
+            x="CURRENT_3M_COUNT",
+            y="3M_CHANGE_PCT",
+            size="CURRENT_3M_COUNT",
+            color="WATCHLIST_NAME",
+            hover_name="WATCHLIST_NAME",
+            labels={"CURRENT_3M_COUNT": "최근 3M 거래건수", "3M_CHANGE_PCT": "3M 가격 변화율(%)"},
+        )
+        quadrant.add_hline(y=0, line_dash="dot", line_color="gray")
+        st.plotly_chart(quadrant, width="stretch")
+    with visual_right:
+        st.subheader("최근 12개월 가격 분포")
+        distribution_start = analysis_as_of_date - pd.DateOffset(months=12) + pd.Timedelta(days=1)
+        distribution = watchlist_transactions[
+            watchlist_transactions["AREA_GROUP"].eq(selected_comparison_area)
+            & watchlist_transactions["CTRT_DAY"].between(distribution_start, analysis_as_of_date)
+        ]
+        st.plotly_chart(
+            px.box(
+                distribution,
+                x="WATCHLIST_NAME",
+                y="THING_AMT",
+                points="all",
+                labels={"WATCHLIST_NAME": "단지", "THING_AMT": "실거래가(억)"},
+            ),
+            width="stretch",
+        )
 
-elif page == "④ 갈아타기 분석":
+elif page == "갈아타기 분석":
     st.header("갈아타기 분석")
     mode = st.radio("비교 방식", ["1:1 비교", "여러 후보 비교"], horizontal=True, key="trade_mode")
 
@@ -820,17 +1272,27 @@ elif page == "④ 갈아타기 분석":
             if observed_gap.empty:
                 st.info("같은 달에 양쪽 거래가 모두 존재한 월이 없습니다.")
             else:
-                gap_figure = px.line(
-                    observed_gap,
-                    x="CONTRACT_YEAR_MONTH", y="MONTHLY_GAP", markers=True,
-                    custom_data=["BASE_MEDIAN_PRICE", "CANDIDATE_MEDIAN_PRICE"],
-                    labels={"CONTRACT_YEAR_MONTH": "계약연월", "MONTHLY_GAP": "월별 GAP(억)"},
+                render_gap_integrated_chart(monthly_gap)
+
+        with st.expander("갈아타기 추가 필요자금", expanded=True):
+            funding_inputs = st.columns(2)
+            acquisition_cost = funding_inputs[0].number_input(
+                "취득 부대비용 가정(억)", min_value=0.0, value=0.5, step=0.1, key="trade_acquisition_cost"
+            )
+            available_cash = funding_inputs[1].number_input(
+                "추가 가용현금(억)", min_value=0.0, value=0.0, step=0.1, key="trade_available_cash"
+            )
+            base_price = result["base"]["price_metrics"]["3M"]["current"]["median_price"]
+            candidate_price = result["candidate"]["price_metrics"]["3M"]["current"]["median_price"]
+            if base_price is None or candidate_price is None:
+                st.info("양쪽 최근 3개월 거래가 있어야 필요자금 워터폴을 표시할 수 있습니다.")
+            else:
+                render_funding_waterfall(
+                    base_price=base_price,
+                    candidate_price=candidate_price,
+                    acquisition_cost=acquisition_cost,
+                    available_cash=available_cash,
                 )
-                gap_figure.update_traces(
-                    hovertemplate="%{x}<br>기준 %{customdata[0]:.2f}억<br>후보 %{customdata[1]:.2f}억<br>GAP %{y:.2f}억<extra></extra>"
-                )
-                gap_figure.add_hline(y=0, line_dash="dot", line_color="gray")
-                st.plotly_chart(gap_figure, width="stretch")
 
     else:
         ref_cols = st.columns(2)
@@ -916,10 +1378,22 @@ elif page == "④ 갈아타기 분석":
                     "CANDIDATE_RECENT_TRADE_AGE": "최근 거래 경과일",
                 },
             )
+            st.plotly_chart(
+                px.bar(
+                    filtered.sort_values("CURRENT_3M_GAP"),
+                    x="CURRENT_3M_GAP",
+                    y="CANDIDATE_COMPLEX",
+                    orientation="h",
+                    color="GAP_STATUS_3M",
+                    text="CANDIDATE_AREA_GROUP",
+                    labels={"CURRENT_3M_GAP": "현재 3M GAP(억)", "CANDIDATE_COMPLEX": "후보 단지", "GAP_STATUS_3M": "GAP 방향"},
+                ),
+                width="stretch",
+            )
             with st.expander("후보 가격·거래량 상세 지표"):
                 st.dataframe(filtered, width="stretch", hide_index=True)
 
-else:
+elif page == "주요 대단지":
     st.header("서울 주요 대단지 시장 참고")
     keywords = [
         "헬리오시티", "파크리오", "잠실엘스", "리센츠", "고덕그라시움",

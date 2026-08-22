@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from data_pipeline import normalize_complex_name
@@ -362,6 +363,173 @@ def build_monthly_price_volume_trend(
     result = monthly.reset_index()
     result["CONTRACT_YEAR_MONTH"] = result["CONTRACT_YEAR_MONTH"].astype(str)
     return result
+
+
+def build_market_area_monthly_trend(
+    transactions: pd.DataFrame,
+    *,
+    area_groups: list[str] | None = None,
+) -> pd.DataFrame:
+    """Aggregate monthly market price and volume without mixing area groups."""
+    required = {"CONTRACT_YEAR_MONTH", "AREA_GROUP", "THING_AMT"}
+    missing = sorted(required.difference(transactions.columns))
+    if missing:
+        raise ValueError(f"시장 평형 추이 컬럼이 없습니다: {', '.join(missing)}")
+    scoped = transactions.dropna(subset=list(required)).copy()
+    if area_groups is not None:
+        scoped = scoped[scoped["AREA_GROUP"].isin(area_groups)]
+    if scoped.empty:
+        return pd.DataFrame(
+            columns=["CONTRACT_YEAR_MONTH", "AREA_GROUP", "TRANSACTION_COUNT", "MEDIAN_PRICE", "MEAN_PRICE"]
+        )
+    return (
+        scoped.groupby(["CONTRACT_YEAR_MONTH", "AREA_GROUP"], as_index=False)
+        .agg(
+            TRANSACTION_COUNT=("THING_AMT", "size"),
+            MEDIAN_PRICE=("THING_AMT", "median"),
+            MEAN_PRICE=("THING_AMT", "mean"),
+        )
+        .sort_values(["CONTRACT_YEAR_MONTH", "AREA_GROUP"])
+        .reset_index(drop=True)
+    )
+
+
+def build_district_market_comparison(
+    transactions: pd.DataFrame,
+    *,
+    area_group: str,
+    analysis_as_of_date: str | pd.Timestamp,
+    months: int = 3,
+    minimum_sample: int = 3,
+) -> pd.DataFrame:
+    """Compare adjacent district price/volume periods for one area group."""
+    required = {"CGG_NM", "AREA_GROUP", "CTRT_DAY", "THING_AMT"}
+    missing = sorted(required.difference(transactions.columns))
+    if missing:
+        raise ValueError(f"자치구 시장 비교 컬럼이 없습니다: {', '.join(missing)}")
+    if months <= 0 or minimum_sample <= 0:
+        raise ValueError("시장 비교 기간과 최소 표본은 1 이상이어야 합니다.")
+
+    as_of = pd.Timestamp(analysis_as_of_date).normalize()
+    current_start, current_end, previous_start, previous_end = _rolling_period_bounds(as_of, months)
+    scoped = transactions[
+        transactions["AREA_GROUP"].eq(area_group)
+        & transactions["CTRT_DAY"].between(previous_start, current_end)
+    ].copy()
+    rows = []
+    for district, district_rows in scoped.groupby("CGG_NM", sort=True):
+        current = district_rows[district_rows["CTRT_DAY"].between(current_start, current_end)]
+        previous = district_rows[district_rows["CTRT_DAY"].between(previous_start, previous_end)]
+        current_count = int(len(current))
+        previous_count = int(len(previous))
+        current_median = float(current["THING_AMT"].median()) if current_count else None
+        previous_median = float(previous["THING_AMT"].median()) if previous_count else None
+        comparable = current_count >= minimum_sample and previous_count >= minimum_sample
+        price_change_pct = (
+            (current_median - previous_median) / previous_median * 100
+            if comparable and previous_median not in {None, 0}
+            else None
+        )
+        volume_change_pct = (
+            (current_count - previous_count) / previous_count * 100
+            if previous_count > 0
+            else None
+        )
+        rows.append(
+            {
+                "DISTRICT": district,
+                "AREA_GROUP": area_group,
+                "CURRENT_COUNT": current_count,
+                "PREVIOUS_COUNT": previous_count,
+                "VOLUME_CHANGE_PCT": volume_change_pct,
+                "CURRENT_MEDIAN_PRICE": current_median,
+                "PREVIOUS_MEDIAN_PRICE": previous_median,
+                "PRICE_CHANGE_PCT": price_change_pct,
+                "SAMPLE_STATUS": "일반" if comparable else "표본 부족",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def build_complex_area_market_screen(
+    transactions: pd.DataFrame,
+    *,
+    analysis_as_of_date: str | pd.Timestamp,
+    months: int = 3,
+    minimum_sample: int = 3,
+) -> pd.DataFrame:
+    """Build a reusable complex × area market screener for recent transactions."""
+    required = {
+        "COMPLEX_ID", "AREA_GROUP", "CTRT_DAY", "THING_AMT",
+        "BLDG_NM", "CGG_NM", "STDG_NM",
+    }
+    missing = sorted(required.difference(transactions.columns))
+    if missing:
+        raise ValueError(f"단지 시장 탐색 컬럼이 없습니다: {', '.join(missing)}")
+    as_of = pd.Timestamp(analysis_as_of_date).normalize()
+    current_start, current_end, previous_start, previous_end = _rolling_period_bounds(as_of, months)
+    twelve_start = as_of - pd.DateOffset(months=12) + pd.Timedelta(days=1)
+    scoped = transactions.dropna(subset=["COMPLEX_ID", "AREA_GROUP"]).copy()
+    scoped = scoped[scoped["CTRT_DAY"].between(twelve_start, current_end)]
+    group_columns = ["COMPLEX_ID", "AREA_GROUP"]
+
+    current = scoped[scoped["CTRT_DAY"].between(current_start, current_end)]
+    if current.empty:
+        return pd.DataFrame()
+    current_stats = current.groupby(group_columns).agg(
+        CURRENT_COUNT=("THING_AMT", "size"),
+        CURRENT_MEDIAN_PRICE=("THING_AMT", "median"),
+        CURRENT_MEAN_PRICE=("THING_AMT", "mean"),
+    )
+    previous = scoped[scoped["CTRT_DAY"].between(previous_start, previous_end)]
+    previous_stats = previous.groupby(group_columns).agg(
+        PREVIOUS_COUNT=("THING_AMT", "size"),
+        PREVIOUS_MEDIAN_PRICE=("THING_AMT", "median"),
+    )
+    twelve_stats = scoped.groupby(group_columns).agg(
+        TWELVE_MONTH_HIGH=("THING_AMT", "max"),
+        TWELVE_MONTH_COUNT=("THING_AMT", "size"),
+    )
+    latest_indices = scoped.groupby(group_columns)["CTRT_DAY"].idxmax()
+    latest = scoped.loc[
+        latest_indices,
+        group_columns + ["BLDG_NM", "CGG_NM", "STDG_NM", "CTRT_DAY", "THING_AMT"],
+    ].set_index(group_columns).rename(
+        columns={"CTRT_DAY": "LATEST_CONTRACT_DATE", "THING_AMT": "LATEST_PRICE"}
+    )
+    result = (
+        current_stats.join(previous_stats, how="left")
+        .join(twelve_stats, how="left")
+        .join(latest, how="left")
+        .reset_index()
+    )
+    result["PREVIOUS_COUNT"] = result["PREVIOUS_COUNT"].fillna(0).astype(int)
+    result["VOLUME_CHANGE_PCT"] = np.where(
+        result["PREVIOUS_COUNT"].gt(0),
+        (result["CURRENT_COUNT"] - result["PREVIOUS_COUNT"])
+        / result["PREVIOUS_COUNT"]
+        * 100,
+        np.nan,
+    )
+    comparable = result["CURRENT_COUNT"].ge(minimum_sample) & result["PREVIOUS_COUNT"].ge(minimum_sample)
+    result["PRICE_CHANGE_PCT"] = np.where(
+        comparable & result["PREVIOUS_MEDIAN_PRICE"].ne(0),
+        (result["CURRENT_MEDIAN_PRICE"] - result["PREVIOUS_MEDIAN_PRICE"])
+        / result["PREVIOUS_MEDIAN_PRICE"]
+        * 100,
+        np.nan,
+    )
+    result["HIGH_GAP_PCT"] = np.where(
+        result["TWELVE_MONTH_HIGH"].ne(0),
+        (result["CURRENT_MEDIAN_PRICE"] - result["TWELVE_MONTH_HIGH"])
+        / result["TWELVE_MONTH_HIGH"]
+        * 100,
+        np.nan,
+    )
+    result["SAMPLE_STATUS"] = np.where(comparable, "일반", "표본 부족")
+    return result.sort_values(
+        ["CURRENT_COUNT", "CURRENT_MEDIAN_PRICE"], ascending=[False, True]
+    ).reset_index(drop=True)
 
 
 def recent_trade_status(age_days: int | None) -> str:
