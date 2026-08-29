@@ -94,6 +94,30 @@ st.markdown(
         border-radius: 10px;
         box-shadow: 0 2px 4px rgba(0,0,0,0.05);
     }
+    [data-testid="stSidebar"] .stRadio > div { gap: 0.35rem; }
+    .ha-hero {
+        padding: 1.15rem 1.3rem;
+        margin: 0.25rem 0 1rem 0;
+        border: 1px solid #dbe4f0;
+        border-radius: 14px;
+        background: linear-gradient(135deg, #f7fbff 0%, #ffffff 70%);
+    }
+    .ha-hero h2 { margin: 0 0 0.35rem 0; font-size: 1.35rem; }
+    .ha-hero p { margin: 0; color: #465568; line-height: 1.65; }
+    .ha-guide {
+        padding: 0.85rem 1rem;
+        border-left: 4px solid #4a90e2;
+        border-radius: 6px;
+        background: #f5f9ff;
+        margin: 0.45rem 0 1rem 0;
+        line-height: 1.65;
+    }
+    .ha-muted { color: #64748b; font-size: 0.9rem; }
+    @media (max-width: 768px) {
+        .block-container { padding-left: 1rem; padding-right: 1rem; }
+        .stMetric { padding: 10px; }
+        .ha-hero { padding: 0.9rem 1rem; }
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -328,6 +352,43 @@ def format_gap_pct(value: object) -> str:
     if value is None or pd.isna(value):
         return "N/A"
     return format_optional_pct(value)
+
+
+def format_relative_date(value: object, reference: pd.Timestamp) -> str:
+    """Show an exact date together with an easy-to-scan relative age."""
+    if value is None or pd.isna(value):
+        return "거래 기록 없음"
+    timestamp = pd.Timestamp(value).normalize()
+    days = max((reference.normalize() - timestamp).days, 0)
+    return f"{timestamp:%Y-%m-%d} · {days}일 전"
+
+
+def sample_explanation(count: int) -> str:
+    if count >= 10:
+        return "거래 표본이 비교적 충분합니다."
+    if count >= 3:
+        return "거래 표본은 비교 가능하지만 개별 거래의 영향을 함께 확인하세요."
+    if count > 0:
+        return "거래가 적어 가격 변화는 참고용으로 보는 것이 좋습니다."
+    return "해당 기간에 거래가 없어 가격 흐름을 판단하기 어렵습니다."
+
+
+def render_plain_language_note(text: str) -> None:
+    st.markdown(f'<div class="ha-guide"><b>쉽게 보기</b><br>{text}</div>', unsafe_allow_html=True)
+
+
+def render_glossary() -> None:
+    with st.expander("용어가 어렵다면 여기를 눌러보세요"):
+        st.markdown(
+            """
+            - **대표가격(중앙값)**: 거래가격을 순서대로 놓았을 때 가운데 값입니다. 일부 고가·저가 거래의 영향을 덜 받습니다.
+            - **최근 3개월(3M)**: 데이터 기준일을 포함한 최근 3개월입니다.
+            - **가격 차이(GAP)**: 후보 주택 대표가격에서 현재 주택 대표가격을 뺀 금액입니다.
+            - **가격 차이 변화**: 이전 기간보다 갈아타기 가격 차이가 커졌는지 작아졌는지를 뜻합니다.
+            - **최근 1년 최고 수준 대비**: 현재 대표가격이 최근 1년 최고 거래가격보다 얼마나 낮은지를 보여줍니다.
+            - **분석 신뢰도**: 거래 표본 수를 기준으로 결과를 어느 정도 참고할 수 있는지 알려주는 안내입니다.
+            """
+        )
 
 
 def render_period_change_metrics(label: str, period: dict) -> None:
@@ -620,21 +681,46 @@ def render_funding_waterfall(
 
 st.sidebar.title("HomeAnalysis")
 analysis_domain = st.sidebar.radio(
-    "분석 영역",
-    ["시장 흐름", "나의 관심 단지"],
+    "무엇을 알아볼까요?",
+    ["서울 시장 살펴보기", "내 관심 단지 살펴보기"],
     key="analysis_domain",
 )
-if analysis_domain == "시장 흐름":
-    page = st.sidebar.radio(
-        "시장 화면",
-        ["시장 요약", "지역·평형", "가격대별 탐색", "단지 움직임", "주요 대단지"],
+if analysis_domain == "서울 시장 살펴보기":
+    market_pages = {
+        "지금 시장은 어떤가요?": "시장 요약",
+        "어느 지역이 움직이나요?": "지역·평형",
+        "내 예산으로 어디를 살 수 있나요?": "가격대별 탐색",
+        "요즘 주목받는 단지는?": "단지 움직임",
+        "서울 대표 단지 흐름": "주요 대단지",
+    }
+    page_label = st.sidebar.radio(
+        "원하는 화면을 선택하세요",
+        list(market_pages),
         key="market_page_navigation",
     )
+    page = market_pages[page_label]
 else:
-    page = st.sidebar.radio(
-        "관심 단지 화면",
-        ["단지 상세", "동일 평형 비교", "갈아타기 분석"],
+    watchlist_pages = {
+        "관심 단지 알아보기": "단지 상세",
+        "관심 단지 비교하기": "동일 평형 비교",
+        "갈아타려면 얼마가 필요할까요?": "갈아타기 분석",
+    }
+    page_label = st.sidebar.radio(
+        "원하는 화면을 선택하세요",
+        list(watchlist_pages),
         key="watchlist_page_navigation",
+    )
+    page = watchlist_pages[page_label]
+
+with st.sidebar.expander("처음 오셨나요?", expanded=False):
+    st.markdown(
+        """
+        1. **서울 시장 살펴보기**에서 전체 흐름을 확인하세요.
+        2. 예산과 평형으로 살펴볼 단지를 찾아보세요.
+        3. 관심 단지를 비교하거나 갈아타기 자금을 계산해보세요.
+
+        화면 위쪽의 **쉽게 보기**를 먼저 읽고, 표와 세부 수치는 필요할 때 펼쳐보면 됩니다.
+        """
     )
 
 api_mode_label = f"저장 파일 + {CURRENT_RECEIPT_YEAR}년 접수연도 API"
@@ -673,7 +759,7 @@ if data_mode == api_mode_label:
                 st.sidebar.error(f"API 수집 실패: {exc}")
 
 st.title("HomeAnalysis")
-st.caption("실거래 기반 주택 가격 흐름과 갈아타기 GAP 분석")
+st.caption("서울 아파트 실거래를 쉬운 말로 살펴보는 대시보드")
 if df.empty:
     st.error("표시할 실거래 데이터를 찾지 못했습니다.")
     st.stop()
@@ -706,11 +792,13 @@ if page in {"가격대별 탐색", "단지 움직임"}:
             CURRENT_RECEIPT_YEAR,
         )
 
-status_columns = st.columns(3)
-status_columns[0].metric("데이터 기준일", format_date(analysis_as_of_date))
-status_columns[1].metric("마지막 자동 업데이트", format_update_time(metadata))
-status_columns[2].metric("최신 계약 기준", f"{delay_days}일 전")
-st.caption("최신 계약일은 계약신고 시차의 영향을 받으며, 지연일 자체가 데이터 오류를 뜻하지 않습니다.")
+st.markdown(
+    f'<div class="ha-muted">데이터 기준 {format_date(analysis_as_of_date)} · '
+    f'마지막 자동 업데이트 {format_update_time(metadata)} · 최신 계약 {delay_days}일 전</div>',
+    unsafe_allow_html=True,
+)
+st.caption("최근 계약은 신고가 늦게 반영될 수 있습니다. 이 화면은 투자 추천이 아닌 실제 신고 거래의 관찰 결과입니다.")
+render_glossary()
 
 with st.sidebar.expander("데이터 품질 상세"):
     st.metric("전체 유효 거래", f"{status['total_count']:,}건")
@@ -739,11 +827,7 @@ if status["missing_past_months"]:
     st.warning(f"이미 지난 계약월 중 데이터가 없는 기간: {missing_labels}")
 
 if page == "시장 요약":
-    st.header("서울 시장 흐름")
-    st.write(
-        "거래량과 평형별 중앙가격을 함께 확인합니다. 전체 중앙가격은 거래 구성의 영향을 받으므로 "
-        "가격지수가 아니라 실제 거래 표본의 흐름으로 해석하세요."
-    )
+    st.header("지금 서울 주택시장은 어떤가요?")
     overview = build_monthly_trend(df)
     recent_overview = overview.tail(12)
     completed_overview = overview.iloc[:-1] if len(overview) > 1 else overview
@@ -756,14 +840,42 @@ if page == "시장 요약":
         if previous_completed["거래건수"]
         else None
     )
+    price_change = (
+        (latest_completed["중앙값"] - previous_completed["중앙값"])
+        / previous_completed["중앙값"]
+        * 100
+        if previous_completed["중앙값"]
+        else None
+    )
+    volume_up = volume_change is not None and volume_change > 0
+    price_up = price_change is not None and price_change > 0
+    if volume_up and price_up:
+        market_mood = "거래와 가격이 함께 늘어나는 흐름"
+        market_detail = "매수·매도 움직임이 모두 활발해지는지 다음 달까지 이어지는지 확인해보세요."
+    elif volume_up and not price_up:
+        market_mood = "가격 조정 속 거래가 늘어나는 흐름"
+        market_detail = "거래 선택지는 늘었지만 가격 방향은 아직 약한 상태입니다."
+    elif not volume_up and price_up:
+        market_mood = "적은 거래 속 가격이 오르는 흐름"
+        market_detail = "일부 거래가 가격을 끌어올렸을 수 있어 지역·평형별 표본을 함께 확인하세요."
+    else:
+        market_mood = "거래와 가격이 함께 쉬어가는 흐름"
+        market_detail = "매수자와 매도자 모두 관망하는지 지역별 차이를 확인해보세요."
+    st.markdown(
+        f'<div class="ha-hero"><h2>{market_mood}</h2><p>'
+        f'{latest_completed["CONTRACT_YEAR_MONTH"]} 완결월 기준 거래량은 직전월보다 '
+        f'{format_optional_pct(volume_change)} 변했고, 거래 구성 대표가격은 '
+        f'{format_optional_pct(price_change)} 변했습니다.<br>{market_detail}</p></div>',
+        unsafe_allow_html=True,
+    )
     market_kpis = st.columns(4)
-    market_kpis[0].metric("최근 완결월", latest_completed["CONTRACT_YEAR_MONTH"])
-    market_kpis[1].metric("월 거래건수", f"{int(latest_completed['거래건수']):,}건")
-    market_kpis[2].metric("직전월 대비 거래량", format_optional_pct(volume_change))
-    market_kpis[3].metric("거래 구성 중앙가격", format_optional_money(latest_completed["중앙값"]))
+    market_kpis[0].metric("비교 기준 월", latest_completed["CONTRACT_YEAR_MONTH"], help="신고가 대부분 반영된 최근 완결월")
+    market_kpis[1].metric("거래량", f"{int(latest_completed['거래건수']):,}건", format_optional_pct(volume_change))
+    market_kpis[2].metric("대표가격", format_optional_money(latest_completed["중앙값"]), format_optional_pct(price_change), help="전체 실거래의 중앙값으로 가격지수와는 다릅니다.")
+    market_kpis[3].metric("데이터 상태", "확인 가능", help="취소 거래를 제외한 유효 거래를 사용합니다.")
     left, right = st.columns(2)
     with left:
-        st.subheader("최근 월별 거래량")
+        st.subheader("최근 12개월 거래량")
         st.plotly_chart(
             px.bar(
                 recent_overview,
@@ -774,7 +886,7 @@ if page == "시장 요약":
             width="stretch",
         )
     with right:
-        st.subheader("평형별 중앙가격")
+        st.subheader("대표 평형별 가격 흐름")
         area_market = build_market_area_monthly_trend(
             df,
             area_groups=["59㎡형", "84㎡형", "114㎡형"],
@@ -791,10 +903,16 @@ if page == "시장 요약":
             ),
             width="stretch",
         )
-    st.info("현재 계약월은 신고가 진행 중이므로 거래량 비교에서는 직전 완결월을 우선 확인하세요.")
+    render_plain_language_note(
+        "막대가 높아지면 거래가 많아진 것이고, 선이 올라가면 해당 평형의 대표가격이 오른 것입니다. "
+        "현재 계약월은 신고 중이므로 직전 완결월을 중심으로 보세요."
+    )
+    with st.expander("이 수치를 해석할 때 주의할 점"):
+        st.write("서울 전체 대표가격은 거래된 지역과 평형의 구성에 따라 움직일 수 있으며 공식 가격지수가 아닙니다. 지역·평형 화면에서 같은 평형끼리 다시 비교하는 것이 안전합니다.")
 
 elif page == "지역·평형":
-    st.header("지역·평형별 시장 온도")
+    st.header("어느 지역이 움직이고 있나요?")
+    st.write("같은 평형끼리 비교해 지역별 가격과 거래량이 최근 어떻게 달라졌는지 살펴봅니다.")
     market_areas = [area for area in ["59㎡형", "84㎡형", "114㎡형"] if area in set(df["AREA_GROUP"].dropna())]
     selected_market_area = st.selectbox(
         "전용면적 그룹",
@@ -808,6 +926,14 @@ elif page == "지역·평형":
         analysis_as_of_date=analysis_as_of_date,
     )
     comparable = district_market[district_market["SAMPLE_STATUS"].eq("일반")].copy()
+    both_up = comparable[
+        comparable["PRICE_CHANGE_PCT"].gt(0) & comparable["VOLUME_CHANGE_PCT"].gt(0)
+    ]["DISTRICT"].tolist()
+    lead_text = ", ".join(both_up[:5]) if both_up else "현재 뚜렷한 지역 없음"
+    render_plain_language_note(
+        f"가격과 거래량이 함께 증가한 지역: <b>{lead_text}</b>. "
+        "한 달의 움직임만으로 상승·하락을 단정하지 말고 거래 표본과 다음 기간 흐름을 함께 확인하세요."
+    )
     breadth = st.columns(4)
     breadth[0].metric("가격 상승 자치구", f"{int(comparable['PRICE_CHANGE_PCT'].gt(0).sum())}개")
     breadth[1].metric("가격 하락 자치구", f"{int(comparable['PRICE_CHANGE_PCT'].lt(0).sum())}개")
@@ -818,7 +944,7 @@ elif page == "지역·평형":
     )
     left, right = st.columns([1, 1.15])
     with left:
-        st.subheader("자치구 변화 히트맵")
+        st.subheader("지역별 변화 한눈에 보기")
         st.plotly_chart(
             px.imshow(
                 heatmap_data,
@@ -831,7 +957,7 @@ elif page == "지역·평형":
             width="stretch",
         )
     with right:
-        st.subheader("가격·거래량 사분면")
+        st.subheader("가격과 거래량의 방향")
         st.plotly_chart(
             px.scatter(
                 comparable,
@@ -844,12 +970,21 @@ elif page == "지역·평형":
             ).add_hline(y=0, line_dash="dot", line_color="gray").add_vline(x=0, line_dash="dot", line_color="gray"),
             width="stretch",
         )
-    st.dataframe(district_market, width="stretch", hide_index=True)
+    with st.expander("사분면 읽는 법과 전체 수치 보기"):
+        st.markdown(
+            """
+            - **오른쪽 위**: 가격과 거래량이 함께 증가
+            - **왼쪽 위**: 거래는 줄었지만 가격은 상승
+            - **오른쪽 아래**: 가격 조정 속 거래 증가
+            - **왼쪽 아래**: 가격과 거래가 함께 감소
+            """
+        )
+        st.dataframe(district_market, width="stretch", hide_index=True)
 
 elif page == "가격대별 탐색":
-    st.header("가격대별 실거래 탐색")
-    st.caption("최근 3개월 중앙가격이 예산 범위에 포함되는 단지 × 평형 후보를 찾습니다.")
-    controls = st.columns([1, 1, 1, 1, 1])
+    st.header("내 예산으로 어디를 살 수 있나요?")
+    st.write("예산과 원하는 평형을 선택하면 최근 3개월 실제 거래를 기준으로 살펴볼 단지를 찾습니다.")
+    controls = st.columns([1, 1, 1])
     screen_areas = sorted(
         market_screen["AREA_GROUP"].dropna().unique(),
         key=lambda value: float(str(value).replace("㎡형", "")),
@@ -860,11 +995,13 @@ elif page == "가격대별 탐색":
         index=screen_areas.index("84㎡형") if "84㎡형" in screen_areas else 0,
         key="budget_area",
     )
+    budget_min = controls[1].number_input("최소 예산(억)", min_value=0.0, value=6.0, step=0.5, key="budget_min")
+    budget_max = controls[2].number_input("최대 예산(억)", min_value=0.0, value=15.0, step=0.5, key="budget_max")
     district_options = ["전체"] + sorted(market_screen["CGG_NM"].dropna().unique().tolist())
-    budget_district = controls[1].selectbox("자치구", district_options, key="budget_district")
-    budget_min = controls[2].number_input("최소 예산(억)", min_value=0.0, value=6.0, step=0.5, key="budget_min")
-    budget_max = controls[3].number_input("최대 예산(억)", min_value=0.0, value=15.0, step=0.5, key="budget_max")
-    minimum_trades = controls[4].number_input("최소 3M 거래", min_value=1, value=3, step=1, key="budget_minimum_trades")
+    with st.expander("상세 조건"):
+        advanced = st.columns(2)
+        budget_district = advanced[0].selectbox("선호 자치구", district_options, key="budget_district")
+        minimum_trades = advanced[1].number_input("최근 3개월 최소 거래건수", min_value=1, value=3, step=1, key="budget_minimum_trades", help="숫자를 높이면 거래가 적은 단지를 제외합니다.")
     if budget_min > budget_max:
         st.warning("최소 예산은 최대 예산보다 클 수 없습니다.")
         candidates = market_screen.iloc[0:0]
@@ -887,6 +1024,10 @@ elif page == "가격대별 탐색":
     if candidates.empty:
         st.info("현재 조건을 충족하는 단지가 없습니다. 예산 범위나 최소 거래건수를 조정해보세요.")
     else:
+        render_plain_language_note(
+            f"조건에 맞는 단지는 <b>{len(candidates):,}개</b>입니다. 점이 위에 있을수록 최근 거래가 많고, "
+            "오른쪽에 있을수록 대표가격이 높습니다. 먼저 거래가 충분한 단지부터 살펴보세요."
+        )
         st.plotly_chart(
             px.scatter(
                 candidates,
@@ -905,13 +1046,14 @@ elif page == "가격대별 탐색":
             "LATEST_PRICE", "CURRENT_COUNT", "PRICE_CHANGE_PCT", "VOLUME_CHANGE_PCT",
             "HIGH_GAP_PCT", "LATEST_CONTRACT_DATE", "SAMPLE_STATUS",
         ]
-        st.dataframe(
-            candidates[candidate_columns].sort_values(["CURRENT_MEDIAN_PRICE", "CURRENT_COUNT"], ascending=[True, False]),
-            width="stretch",
-            hide_index=True,
-        )
+        with st.expander("조건에 맞는 단지 전체 목록", expanded=True):
+            st.dataframe(
+                candidates[candidate_columns].sort_values(["CURRENT_MEDIAN_PRICE", "CURRENT_COUNT"], ascending=[True, False]),
+                width="stretch",
+                hide_index=True,
+            )
 
-    st.subheader("가격대 × 자치구 최근 실거래")
+    st.subheader("지역별로 어느 가격대에서 거래됐나요?")
     recent_start = analysis_as_of_date - pd.DateOffset(months=3) + pd.Timedelta(days=1)
     recent_trades = df[
         df["AREA_GROUP"].eq(budget_area)
@@ -936,16 +1078,24 @@ elif page == "가격대별 탐색":
         ),
         width="stretch",
     )
+    st.caption("색이 진할수록 해당 지역·가격대의 최근 실거래가 많습니다.")
 
 elif page == "단지 움직임":
-    st.header("단지 움직임")
-    st.caption("동일 단지·동일 평형의 최근 3개월과 직전 3개월을 비교한 관찰 지표입니다.")
+    st.header("요즘 어떤 단지가 움직이고 있나요?")
+    movement_descriptions = {
+        "거래 활발": "최근 3개월 동안 실제 매매가 자주 이루어진 단지",
+        "거래량 급증": "직전 3개월보다 거래가 빠르게 늘어난 단지",
+        "가격 상승": "거래 표본이 확보되고 대표가격이 오른 단지",
+        "가격 조정": "거래 표본이 확보되고 대표가격이 낮아진 단지",
+        "고점 접근": "현재 가격이 최근 1년 최고 거래 수준에 가까운 단지",
+    }
     controls = st.columns(3)
     movement_type = controls[0].selectbox(
         "관찰 유형",
         ["거래 활발", "거래량 급증", "가격 상승", "가격 조정", "고점 접근"],
         key="movement_type",
     )
+    st.caption(movement_descriptions[movement_type])
     movement_areas = ["전체"] + sorted(
         market_screen["AREA_GROUP"].dropna().unique(),
         key=lambda value: float(str(value).replace("㎡형", "")),
@@ -987,6 +1137,9 @@ elif page == "단지 움직임":
         st.info("현재 조건에 해당하는 단지가 없습니다.")
     else:
         movement["COMPLEX_AREA_LABEL"] = movement["BLDG_NM"] + " · " + movement["AREA_GROUP"]
+        render_plain_language_note(
+            f"<b>{movement_type}</b> 기준 상위 단지입니다. 순위는 추천 점수가 아니라 최근 실거래에서 관찰된 변화입니다."
+        )
         st.plotly_chart(
             px.bar(
                 movement.sort_values(metric_column),
@@ -998,16 +1151,18 @@ elif page == "단지 움직임":
             ),
             width="stretch",
         )
-        st.dataframe(
-            movement[
-                ["BLDG_NM", "CGG_NM", "STDG_NM", "AREA_GROUP", "CURRENT_MEDIAN_PRICE", "CURRENT_COUNT", "PREVIOUS_COUNT", "PRICE_CHANGE_PCT", "VOLUME_CHANGE_PCT", "HIGH_GAP_PCT", "LATEST_CONTRACT_DATE", "SAMPLE_STATUS"]
-            ],
-            width="stretch",
-            hide_index=True,
-        )
+        with st.expander("선정 근거와 전체 수치 보기"):
+            st.dataframe(
+                movement[
+                    ["BLDG_NM", "CGG_NM", "STDG_NM", "AREA_GROUP", "CURRENT_MEDIAN_PRICE", "CURRENT_COUNT", "PREVIOUS_COUNT", "PRICE_CHANGE_PCT", "VOLUME_CHANGE_PCT", "HIGH_GAP_PCT", "LATEST_CONTRACT_DATE", "SAMPLE_STATUS"]
+                ],
+                width="stretch",
+                hide_index=True,
+            )
 
 elif page == "단지 상세":
-    st.header("단지 상세")
+    st.header("관심 단지 알아보기")
+    st.write("단지와 평형을 고르면 최근 실제 거래, 대표가격, 거래량을 한 화면에서 확인할 수 있습니다.")
     selectors = st.columns(2)
     selected_name = selectors[0].selectbox(
         "단지", watchlist["display_name"].tolist(), key="detail_complex"
@@ -1029,15 +1184,26 @@ elif page == "단지 상세":
         data_available_from=data_available_from,
     )
     current_3m = metrics["3M"]["current"]
-    top = st.columns(6)
-    top[0].metric("선택", f"{selected_name} · {selected_area}")
-    top[1].metric("최근 거래일", format_date(metrics["latest_contract_date"]))
-    top[2].metric("최근 실거래가", format_optional_money(metrics["latest_price"]))
-    top[3].metric("최근 3M 중앙값", format_optional_money(current_3m["median_price"]))
-    top[4].metric("3M 변화율", format_optional_pct(metrics["3M"]["price_change_pct"]))
-    top[5].metric("최근 3M 거래", f"{current_3m['transaction_count']}건 · {current_3m['sample_status']}")
+    direction = metrics["3M"]["price_change_pct"]
+    if direction is None or pd.isna(direction):
+        direction_text = "직전 기간과 가격을 비교할 수 없습니다."
+    elif direction > 0:
+        direction_text = f"대표가격이 직전 3개월보다 {abs(direction):.1f}% 높아졌습니다."
+    elif direction < 0:
+        direction_text = f"대표가격이 직전 3개월보다 {abs(direction):.1f}% 낮아졌습니다."
+    else:
+        direction_text = "대표가격이 직전 3개월과 비슷합니다."
+    render_plain_language_note(
+        f"<b>{selected_name} {selected_area}</b>의 {direction_text} "
+        f"{sample_explanation(int(current_3m['transaction_count']))}"
+    )
+    top = st.columns(4)
+    top[0].metric("최근 실거래가", format_optional_money(metrics["latest_price"]), help="가장 최근에 신고된 유효 거래")
+    top[1].metric("최근 3개월 대표가격", format_optional_money(current_3m["median_price"]), format_optional_pct(metrics["3M"]["price_change_pct"]))
+    top[2].metric("최근 거래", format_relative_date(metrics["latest_contract_date"], analysis_as_of_date))
+    top[3].metric("최근 3개월 거래", f"{current_3m['transaction_count']}건", help=f"분석 신뢰도: {current_3m['sample_status']}")
 
-    with st.expander("3M · 6M · 12M 가격 상세", expanded=True):
+    with st.expander("기간별 가격과 거래량 자세히 보기"):
         render_period_change_metrics("3개월", metrics["3M"])
         render_period_change_metrics("6개월", metrics["6M"])
         twelve = metrics["12M"]["current"]
@@ -1047,7 +1213,7 @@ elif page == "단지 상세":
         twelve_cols[2].metric("12M 최고가", format_optional_money(twelve["highest_price"]))
         twelve_cols[3].metric("12M 최저가", format_optional_money(twelve["lowest_price"]))
         twelve_cols[4].metric("고점 대비", format_optional_pct(metrics["12M"]["high_gap_pct"]))
-    with st.expander("월별 가격·거래량", expanded=True):
+    with st.expander("월별 가격·거래량과 개별 실거래", expanded=True):
         render_integrated_trade_chart(
             selected_transactions,
             title=f"{selected_name} {selected_area} 가격·거래량·개별 실거래",
@@ -1086,7 +1252,8 @@ elif page == "단지 상세":
         )
 
 elif page == "동일 평형 비교":
-    st.header("Watchlist 동일 평형 비교")
+    st.header("관심 단지를 같은 평형끼리 비교해보세요")
+    st.write("면적이 다른 주택의 가격이 섞이지 않도록 같은 전용면적 그룹끼리 비교합니다.")
     watchlist_area_groups = set()
     for transactions in watchlist_scopes.values():
         watchlist_area_groups.update(transactions["AREA_GROUP"].dropna())
@@ -1121,6 +1288,31 @@ elif page == "동일 평형 비교":
     ordered = comparison.sort_values(
         sort_labels[sort_label], ascending=not descending, na_position="last", kind="stable"
     )
+    available_comparison = comparison[comparison["AREA_AVAILABLE"]].copy()
+    insight_cols = st.columns(3)
+    if not available_comparison.empty:
+        priced = available_comparison.dropna(subset=["CURRENT_3M_MEDIAN"])
+        active = available_comparison.dropna(subset=["CURRENT_3M_COUNT"])
+        fresh = available_comparison.dropna(subset=["RECENT_TRADE_AGE_DAYS"])
+        cheapest = priced.loc[priced["CURRENT_3M_MEDIAN"].idxmin()] if not priced.empty else None
+        most_active = active.loc[active["CURRENT_3M_COUNT"].idxmax()] if not active.empty else None
+        most_recent = fresh.loc[fresh["RECENT_TRADE_AGE_DAYS"].idxmin()] if not fresh.empty else None
+        insight_cols[0].metric(
+            "대표가격이 가장 낮은 단지",
+            cheapest["WATCHLIST_NAME"] if cheapest is not None else "-",
+            format_optional_money(cheapest["CURRENT_3M_MEDIAN"]) if cheapest is not None else None,
+        )
+        insight_cols[1].metric(
+            "최근 거래가 가장 많은 단지",
+            most_active["WATCHLIST_NAME"] if most_active is not None else "-",
+            f"최근 3개월 {int(most_active['CURRENT_3M_COUNT'])}건" if most_active is not None else None,
+        )
+        insight_cols[2].metric(
+            "가장 최근 거래가 있는 단지",
+            most_recent["WATCHLIST_NAME"] if most_recent is not None else "-",
+            f"{int(most_recent['RECENT_TRADE_AGE_DAYS'])}일 전" if most_recent is not None else None,
+        )
+        st.caption("조건별 관찰 결과이며 특정 단지에 대한 매수 추천이 아닙니다.")
     core = ordered[
         [
             "WATCHLIST_NAME", "AREA_GROUP", "RECENT_PRICE", "RECENT_CONTRACT_DATE",
@@ -1128,21 +1320,22 @@ elif page == "동일 평형 비교":
             "CURRENT_3M_COUNT", "3M_SAMPLE_STATUS", "6M_CHANGE_PCT", "HIGH_GAP_PCT",
         ]
     ]
-    st.dataframe(
-        core,
-        width="stretch",
-        hide_index=True,
-        column_config={
-            "WATCHLIST_NAME": "단지명", "AREA_GROUP": "평형",
-            "RECENT_PRICE": st.column_config.NumberColumn("최근 실거래가", format="%.2f억"),
-            "RECENT_CONTRACT_DATE": st.column_config.DateColumn("최근 거래일", format="YYYY-MM-DD"),
-            "RECENT_TRADE_AGE_DAYS": "경과일", "CURRENT_3M_MEDIAN": st.column_config.NumberColumn("3M 중앙값", format="%.2f억"),
-            "3M_CHANGE_PCT": st.column_config.NumberColumn("3M 변화율", format="%+.1f%%"),
-            "CURRENT_3M_COUNT": "3M 거래", "3M_SAMPLE_STATUS": "표본 상태",
-            "6M_CHANGE_PCT": st.column_config.NumberColumn("6M 변화율", format="%+.1f%%"),
-            "HIGH_GAP_PCT": st.column_config.NumberColumn("고점 대비", format="%+.1f%%"),
-        },
-    )
+    with st.expander("단지별 비교표", expanded=True):
+        st.dataframe(
+            core,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "WATCHLIST_NAME": "단지명", "AREA_GROUP": "평형",
+                "RECENT_PRICE": st.column_config.NumberColumn("최근 실거래가", format="%.2f억"),
+                "RECENT_CONTRACT_DATE": st.column_config.DateColumn("최근 거래일", format="YYYY-MM-DD"),
+                "RECENT_TRADE_AGE_DAYS": "경과일", "CURRENT_3M_MEDIAN": st.column_config.NumberColumn("최근 3개월 대표가격", format="%.2f억"),
+                "3M_CHANGE_PCT": st.column_config.NumberColumn("최근 3개월 변화", format="%+.1f%%"),
+                "CURRENT_3M_COUNT": "최근 3개월 거래", "3M_SAMPLE_STATUS": "분석 신뢰도",
+                "6M_CHANGE_PCT": st.column_config.NumberColumn("최근 6개월 변화", format="%+.1f%%"),
+                "HIGH_GAP_PCT": st.column_config.NumberColumn("최근 1년 최고 대비", format="%+.1f%%"),
+            },
+        )
     with st.expander("3·6·12개월 상세 비교"):
         st.dataframe(ordered, width="stretch", hide_index=True)
     missing_count = int((~comparison["AREA_AVAILABLE"]).sum())
@@ -1184,10 +1377,11 @@ elif page == "동일 평형 비교":
         )
 
 elif page == "갈아타기 분석":
-    st.header("갈아타기 분석")
-    mode = st.radio("비교 방식", ["1:1 비교", "여러 후보 비교"], horizontal=True, key="trade_mode")
+    st.header("갈아타려면 얼마가 필요할까요?")
+    st.write("현재 주택과 옮기고 싶은 주택의 최근 대표가격을 비교하고 추가 필요자금을 계산합니다.")
+    mode = st.radio("비교 방식", ["한 곳과 자세히 비교", "여러 후보 한꺼번에 비교"], horizontal=True, key="trade_mode")
 
-    if mode == "1:1 비교":
+    if mode == "한 곳과 자세히 비교":
         selectors = st.columns(2)
         with selectors[0]:
             base_name = st.selectbox("기준 단지", watchlist["display_name"].tolist(), key="v2_base_complex")
@@ -1215,20 +1409,25 @@ elif page == "갈아타기 분석":
             data_available_from=data_available_from,
         )
         st.subheader(f"{base_name} {base_area} → {candidate_name} {candidate_area}")
-        kpis = st.columns(8)
-        kpis[0].metric("현재 3M GAP", format_gap_money(result["3M"]["current_gap"], signed=True))
-        kpis[1].metric("3M 변화", format_gap_money(result["3M"]["gap_change"], signed=True))
-        kpis[2].metric("3M 상태", result["3M"]["gap_change_status"])
-        kpis[3].metric("현재 6M GAP", format_gap_money(result["6M"]["current_gap"], signed=True))
-        kpis[4].metric("6M 변화", format_gap_money(result["6M"]["gap_change"], signed=True))
-        kpis[5].metric("6M 상태", result["6M"]["gap_change_status"])
-        kpis[6].metric("가격 프리미엄", format_gap_pct(result["price_premium_pct"]))
-        kpis[7].metric("GAP 지속성", result["gap_persistence_status"])
-        st.caption("가격 프리미엄과 GAP 지속성은 상대 가격과 변화 방향을 보여주는 관찰 지표이며 추천점수가 아닙니다.")
+        current_gap = result["3M"]["current_gap"]
+        gap_change = result["3M"]["gap_change"]
+        if current_gap is None or pd.isna(current_gap):
+            gap_sentence = "최근 거래가 부족해 두 주택의 가격 차이를 계산할 수 없습니다."
+        else:
+            gap_sentence = f"최근 3개월 대표가격 기준으로 후보 주택이 현재 주택보다 <b>{abs(current_gap):.2f}억원 {'비쌉니다' if current_gap >= 0 else '저렴합니다'}</b>."
+        if gap_change is not None and not pd.isna(gap_change):
+            gap_sentence += f" 이 차이는 직전 3개월보다 {abs(gap_change):.2f}억원 {'커졌습니다' if gap_change > 0 else '작아졌습니다' if gap_change < 0 else '변하지 않았습니다'}."
+        render_plain_language_note(gap_sentence)
+        kpis = st.columns(4)
+        kpis[0].metric("현재 가격 차이", format_gap_money(current_gap, signed=True), help="후보 대표가격 - 현재 주택 대표가격")
+        kpis[1].metric("가격 차이 변화", format_gap_money(gap_change, signed=True), result["3M"]["gap_change_status"])
+        kpis[2].metric("후보가 더 비싼 정도", format_gap_pct(result["price_premium_pct"]))
+        kpis[3].metric("차이의 지속성", result["gap_persistence_status"])
+        st.caption("가격 차이와 지속성은 관찰 지표이며 추천점수가 아닙니다.")
 
         base_metrics = result["base"]["price_metrics"]
         candidate_metrics = result["candidate"]["price_metrics"]
-        with st.expander("직전 GAP · 변화율 · 표본 · 최근 거래 상세", expanded=True):
+        with st.expander("기간별 가격 차이와 거래 근거 자세히 보기"):
             rows = []
             for label, name, area, home in [
                 ("기준", base_name, base_area, result["base"]),
@@ -1264,7 +1463,7 @@ elif page == "갈아타기 분석":
         )
         observed_gap = monthly_gap.dropna(subset=["MONTHLY_GAP"])
         observed_count = int(len(observed_gap))
-        with st.expander("월별 GAP 추세", expanded=True):
+        with st.expander("월별 가격 차이 추세"):
             st.caption(
                 f"월별 GAP 관측 {observed_count} / 12개월 · "
                 f"{monthly_gap_observation_status(observed_count)} · 실제 양쪽 거래가 있는 월만 표시"
@@ -1274,7 +1473,7 @@ elif page == "갈아타기 분석":
             else:
                 render_gap_integrated_chart(monthly_gap)
 
-        with st.expander("갈아타기 추가 필요자금", expanded=True):
+        with st.expander("나에게 필요한 추가자금 계산", expanded=True):
             funding_inputs = st.columns(2)
             acquisition_cost = funding_inputs[0].number_input(
                 "취득 부대비용 가정(억)", min_value=0.0, value=0.5, step=0.1, key="trade_acquisition_cost"
@@ -1287,6 +1486,11 @@ elif page == "갈아타기 분석":
             if base_price is None or candidate_price is None:
                 st.info("양쪽 최근 3개월 거래가 있어야 필요자금 워터폴을 표시할 수 있습니다.")
             else:
+                required_cash = candidate_price - base_price + acquisition_cost - available_cash
+                st.success(
+                    f"현재 입력값 기준 예상 추가 필요자금은 약 {required_cash:.2f}억원입니다. "
+                    "대출 가능액과 실제 세금·중개보수는 별도로 확인해야 합니다."
+                )
                 render_funding_waterfall(
                     base_price=base_price,
                     candidate_price=candidate_price,
