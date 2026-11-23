@@ -1,13 +1,13 @@
 {
-  "updated_at": "2026-11-22T00:23:49.566007+00:00",
+  "updated_at": "2026-11-23T00:56:34.743578+00:00",
   "receipt_year": 2026,
   "fetched_count": 111959,
   "stored_count": 111959,
   "within_snapshot_rows_removed": 0,
   "snapshot_storage_mode": "authoritative_replace",
-  "snapshot_overlaps_removed": 723,
-  "new_or_changed_rows": 111236,
-  "stale_or_changed_rows_replaced": 110849,
+  "snapshot_overlaps_removed": 750,
+  "new_or_changed_rows": 111209,
+  "stale_or_changed_rows_replaced": 111209,
   "snapshot_match_columns": [
     "RCPT_YR",
     "CGG_CD",
